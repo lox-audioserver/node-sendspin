@@ -1,5 +1,5 @@
 {
-  "name": "node-sendspin",
+  "name": "@lox-audioserver/node-sendspin",
   "version": "0.1.0",
   "description": "Nodejs implementation of the Sendspin protocol.",
   "type": "module",

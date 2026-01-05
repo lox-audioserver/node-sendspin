@@ -5,7 +5,7 @@ TypeScript/Node.js implementation of the sendspin protocol. Built to be consumed
 ## Install
 
 ```sh
-npm install node-sendspin
+npm install @lox-audioserver/node-sendspin
 ```
 
 ## Quickstart
@@ -16,7 +16,7 @@ import {
   Roles,
   AudioCodec,
   MediaCommand,
-} from 'node-sendspin';
+} from '@lox-audioserver/node-sendspin';
 
 const client = new SendspinClient('my-client-id', 'My Player', [Roles.PLAYER], {
   playerSupport: {
@@ -44,7 +44,7 @@ await client.sendGroupCommand(MediaCommand.PLAY);
 ### Simple server
 
 ```ts
-import { SendspinServer } from 'node-sendspin';
+import { SendspinServer } from '@lox-audioserver/node-sendspin';
 
 const server = new SendspinServer('server-id', 'My Sendspin Server');
 server.on('client-added', (evt) => console.log('client connected', evt.clientId));
