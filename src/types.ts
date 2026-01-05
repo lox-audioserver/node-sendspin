@@ -1,0 +1,398 @@
+/**
+ * Core Sendspin protocol enums and message payload types.
+ * These mirror the reference `aiosendspin` Python library but are expressed
+ * as TypeScript interfaces so they can be used directly with JSON.
+ */
+
+export enum Roles {
+  PLAYER = 'player@v1',
+  CONTROLLER = 'controller@v1',
+  METADATA = 'metadata@v1',
+  ARTWORK = 'artwork@v1',
+  VISUALIZER = 'visualizer@v1',
+}
+
+export type RoleName = Roles | string;
+
+export enum BinaryMessageType {
+  AUDIO_CHUNK = 4,
+  ARTWORK_CHANNEL_0 = 8,
+  ARTWORK_CHANNEL_1 = 9,
+  ARTWORK_CHANNEL_2 = 10,
+  ARTWORK_CHANNEL_3 = 11,
+  VISUALIZATION_DATA = 16,
+}
+
+export enum RepeatMode {
+  OFF = 'off',
+  ONE = 'one',
+  ALL = 'all',
+}
+
+export enum ClientStateType {
+  SYNCHRONIZED = 'synchronized',
+  ERROR = 'error',
+  EXTERNAL_SOURCE = 'external_source',
+}
+
+export enum PlaybackStateType {
+  PLAYING = 'playing',
+  PAUSED = 'paused',
+  STOPPED = 'stopped',
+}
+
+export enum AudioCodec {
+  OPUS = 'opus',
+  FLAC = 'flac',
+  PCM = 'pcm',
+}
+
+export enum PlayerCommand {
+  VOLUME = 'volume',
+  MUTE = 'mute',
+}
+
+export enum MediaCommand {
+  PLAY = 'play',
+  PAUSE = 'pause',
+  STOP = 'stop',
+  NEXT = 'next',
+  PREVIOUS = 'previous',
+  VOLUME = 'volume',
+  MUTE = 'mute',
+  REPEAT_OFF = 'repeat_off',
+  REPEAT_ONE = 'repeat_one',
+  REPEAT_ALL = 'repeat_all',
+  SHUFFLE = 'shuffle',
+  UNSHUFFLE = 'unshuffle',
+  SWITCH = 'switch',
+}
+
+export enum PictureFormat {
+  BMP = 'bmp',
+  JPEG = 'jpeg',
+  PNG = 'png',
+}
+
+export enum ArtworkSource {
+  ALBUM = 'album',
+  ARTIST = 'artist',
+  NONE = 'none',
+}
+
+export enum ConnectionReason {
+  DISCOVERY = 'discovery',
+  PLAYBACK = 'playback',
+}
+
+export enum GoodbyeReason {
+  ANOTHER_SERVER = 'another_server',
+  SHUTDOWN = 'shutdown',
+  RESTART = 'restart',
+  USER_REQUEST = 'user_request',
+}
+
+export type UndefinedField = typeof UNDEFINED_FIELD;
+export const UNDEFINED_FIELD = Symbol('sendspin/undefined');
+export const undefinedField = (): UndefinedField => UNDEFINED_FIELD;
+export const isUndefinedField = (
+  value: unknown,
+): value is UndefinedField => value === UNDEFINED_FIELD;
+
+export interface DeviceInfo {
+  product_name?: string | null;
+  manufacturer?: string | null;
+  software_version?: string | null;
+}
+
+export interface SupportedAudioFormat {
+  codec: AudioCodec;
+  channels: number;
+  sample_rate: number;
+  bit_depth: number;
+}
+
+export interface ClientHelloPlayerSupport {
+  supported_formats: SupportedAudioFormat[];
+  buffer_capacity: number;
+  supported_commands: PlayerCommand[];
+}
+
+export interface ArtworkChannel {
+  source: ArtworkSource;
+  format: PictureFormat;
+  media_width: number;
+  media_height: number;
+}
+
+export interface ClientHelloArtworkSupport {
+  channels: ArtworkChannel[];
+}
+
+export interface ClientHelloVisualizerSupport {
+  buffer_capacity: number;
+}
+
+export interface StreamArtworkChannelConfig {
+  source: ArtworkSource;
+  format: PictureFormat;
+  width: number;
+  height: number;
+}
+
+export interface StreamStartArtwork {
+  channels: StreamArtworkChannelConfig[];
+}
+
+export interface StreamRequestFormatArtwork {
+  channel: number;
+  source?: ArtworkSource;
+  format?: PictureFormat;
+  media_width?: number;
+  media_height?: number;
+}
+
+export interface StreamStartVisualizer {
+  // Placeholder for spec parity
+}
+
+export interface Progress {
+  track_progress: number;
+  track_duration: number;
+  playback_speed: number;
+}
+
+export interface SessionUpdateMetadata {
+  timestamp: number;
+  title?: string | null | UndefinedField;
+  artist?: string | null | UndefinedField;
+  album_artist?: string | null | UndefinedField;
+  album?: string | null | UndefinedField;
+  artwork_url?: string | null | UndefinedField;
+  year?: number | null | UndefinedField;
+  track?: number | null | UndefinedField;
+  progress?: Progress | null | UndefinedField;
+  repeat?: RepeatMode | null | UndefinedField;
+  shuffle?: boolean | null | UndefinedField;
+}
+
+export interface ControllerCommandPayload {
+  command: MediaCommand;
+  volume?: number;
+  mute?: boolean;
+}
+
+export interface ControllerStatePayload {
+  supported_commands: MediaCommand[];
+  volume: number;
+  muted: boolean;
+}
+
+export interface ClientHelloPayload {
+  client_id: string;
+  name: string;
+  version: number;
+  supported_roles: RoleName[];
+  device_info?: DeviceInfo;
+  ['player@v1_support']?: ClientHelloPlayerSupport;
+  ['artwork@v1_support']?: ClientHelloArtworkSupport;
+  ['visualizer@v1_support']?: ClientHelloVisualizerSupport;
+}
+
+export interface ClientHelloMessage {
+  type: 'client/hello';
+  payload: ClientHelloPayload;
+}
+
+export interface ClientTimePayload {
+  client_transmitted: number;
+}
+
+export interface ClientTimeMessage {
+  type: 'client/time';
+  payload: ClientTimePayload;
+}
+
+export interface PlayerStatePayload {
+  state?: ClientStateType;
+  volume?: number;
+  muted?: boolean;
+}
+
+export interface ClientStatePayload {
+  state?: ClientStateType;
+  player?: PlayerStatePayload;
+}
+
+export interface ClientStateMessage {
+  type: 'client/state';
+  payload: ClientStatePayload;
+}
+
+export interface ClientCommandPayload {
+  controller?: ControllerCommandPayload;
+}
+
+export interface ClientCommandMessage {
+  type: 'client/command';
+  payload: ClientCommandPayload;
+}
+
+export interface ClientGoodbyePayload {
+  reason: GoodbyeReason;
+}
+
+export interface ClientGoodbyeMessage {
+  type: 'client/goodbye';
+  payload: ClientGoodbyePayload;
+}
+
+export interface StreamRequestFormatPayload {
+  player?: StreamRequestFormatPlayer;
+  artwork?: StreamRequestFormatArtwork;
+}
+
+export interface StreamRequestFormatMessage {
+  type: 'stream/request-format';
+  payload: StreamRequestFormatPayload;
+}
+
+export interface StreamRequestFormatPlayer {
+  codec?: AudioCodec;
+  sample_rate?: number;
+  channels?: number;
+  bit_depth?: number;
+}
+
+export interface ServerHelloPayload {
+  server_id: string;
+  name: string;
+  version: number;
+  active_roles: RoleName[];
+  connection_reason: ConnectionReason;
+}
+
+export interface ServerHelloMessage {
+  type: 'server/hello';
+  payload: ServerHelloPayload;
+}
+
+export interface ServerTimePayload {
+  client_transmitted: number;
+  server_received: number;
+  server_transmitted: number;
+}
+
+export interface ServerTimeMessage {
+  type: 'server/time';
+  payload: ServerTimePayload;
+}
+
+export interface ServerStatePayload {
+  metadata?: SessionUpdateMetadata;
+  controller?: ControllerStatePayload;
+}
+
+export interface ServerStateMessage {
+  type: 'server/state';
+  payload: ServerStatePayload;
+}
+
+export interface GroupUpdateServerPayload {
+  playback_state?: PlaybackStateType;
+  group_id?: string;
+  group_name?: string;
+}
+
+export interface GroupUpdateServerMessage {
+  type: 'group/update';
+  payload: GroupUpdateServerPayload;
+}
+
+export interface StreamStartPlayer {
+  codec: AudioCodec;
+  sample_rate: number;
+  channels: number;
+  bit_depth: number;
+  codec_header?: string | null;
+}
+
+export interface StreamStartPayload {
+  player?: StreamStartPlayer;
+  artwork?: StreamStartArtwork;
+  visualizer?: StreamStartVisualizer;
+}
+
+export interface StreamStartMessage {
+  type: 'stream/start';
+  payload: StreamStartPayload;
+}
+
+export interface StreamClearPayload {
+  roles?: RoleName[];
+}
+
+export interface StreamClearMessage {
+  type: 'stream/clear';
+  payload: StreamClearPayload;
+}
+
+export interface StreamEndPayload {
+  roles?: RoleName[];
+}
+
+export interface StreamEndMessage {
+  type: 'stream/end';
+  payload: StreamEndPayload;
+}
+
+export interface PlayerCommandPayload {
+  command: PlayerCommand;
+  volume?: number;
+  mute?: boolean;
+}
+
+export interface ServerCommandPayload {
+  player?: PlayerCommandPayload;
+}
+
+export interface ServerCommandMessage {
+  type: 'server/command';
+  payload: ServerCommandPayload;
+}
+
+export type ClientOutboundMessage =
+  | ClientHelloMessage
+  | ClientTimeMessage
+  | ClientStateMessage
+  | ClientCommandMessage
+  | ClientGoodbyeMessage
+  | StreamRequestFormatMessage;
+
+export type ServerInboundMessage =
+  | ServerHelloMessage
+  | ServerTimeMessage
+  | ServerStateMessage
+  | GroupUpdateServerMessage
+  | StreamStartMessage
+  | StreamClearMessage
+  | StreamEndMessage
+  | ServerCommandMessage;
+
+export type ServerOutboundMessage =
+  | ServerHelloMessage
+  | ServerTimeMessage
+  | ServerStateMessage
+  | GroupUpdateServerMessage
+  | StreamStartMessage
+  | StreamClearMessage
+  | StreamEndMessage
+  | ServerCommandMessage;
+
+export type ClientInboundMessage =
+  | ClientHelloMessage
+  | ClientTimeMessage
+  | ClientStateMessage
+  | ClientCommandMessage
+  | ClientGoodbyeMessage
+  | StreamRequestFormatMessage;
