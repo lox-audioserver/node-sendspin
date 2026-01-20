@@ -8,3 +8,6 @@ export * from './server/events.js';
 export * from './server/clock.js';
 export * from './server/session.js';
 export * from './server/core.js';
+import { SendspinCore } from './server/core.js';
+
+export const sendspinCore = new SendspinCore();

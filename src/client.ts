@@ -11,6 +11,7 @@ import {
   ClientHelloMessage,
   ClientHelloPayload,
   ClientHelloPlayerSupport,
+  ClientHelloSourceSupport,
   ClientHelloVisualizerSupport,
   ClientOutboundMessage,
   ClientStateMessage,
@@ -40,8 +41,11 @@ import {
   StreamEndPayload,
   StreamStartMessage,
   StreamStartPayload,
+  SourceClientCommand,
+  SourceCommandPayload,
+  SourceStatePayload,
 } from './types.js';
-import { BINARY_HEADER_SIZE, unpackBinaryHeader } from './binary.js';
+import { BINARY_HEADER_SIZE, packBinaryHeaderRaw, unpackBinaryHeader } from './binary.js';
 import { SendspinTimeFilter } from './time-filter.js';
 
 export type MetadataCallback = (payload: ServerStatePayload) => void;
@@ -50,9 +54,10 @@ export type ControllerStateCallback = (payload: ServerStatePayload) => void;
 export type StreamStartCallback = (message: StreamStartMessage) => void;
 export type StreamEndCallback = (roles: RoleName[] | undefined) => void;
 export type StreamClearCallback = (roles: RoleName[] | undefined) => void;
-export type AudioChunkCallback = (timestampUs: number, audioData: Buffer, format: PCMFormat) => void;
+export type AudioChunkCallback = (timestampUs: number, audioData: Buffer, format: AudioFormat) => void;
 export type DisconnectCallback = () => void;
 export type ServerCommandCallback = (payload: ServerCommandPayload) => void;
+export type SourceCommandCallback = (payload: SourceCommandPayload) => void;
 
 export class PCMFormat {
   constructor(
@@ -70,11 +75,20 @@ export class PCMFormat {
   }
 }
 
+export class AudioFormat {
+  constructor(
+    public readonly codec: AudioCodec,
+    public readonly pcm: PCMFormat,
+    public readonly codecHeader?: Buffer,
+  ) {}
+}
+
 export interface SendspinClientOptions {
   deviceInfo?: ClientHelloPayload['device_info'];
   playerSupport?: ClientHelloPlayerSupport;
   artworkSupport?: ClientHelloArtworkSupport;
   visualizerSupport?: ClientHelloVisualizerSupport;
+  sourceSupport?: ClientHelloSourceSupport;
   staticDelayMs?: number;
   initialVolume?: number;
   initialMuted?: boolean;
@@ -96,6 +110,7 @@ export class SendspinClient {
   private readonly playerSupport?: ClientHelloPlayerSupport;
   private readonly artworkSupport?: ClientHelloArtworkSupport;
   private readonly visualizerSupport?: ClientHelloVisualizerSupport;
+  private readonly sourceSupport?: ClientHelloSourceSupport;
 
   private ws?: WebSocket;
   private connected = false;
@@ -103,7 +118,7 @@ export class SendspinClient {
   private serverHelloResolve?: () => void;
   private timeFilter = new SendspinTimeFilter();
   private streamActive = false;
-  private currentPCMFormat?: PCMFormat;
+  private currentAudioFormat?: AudioFormat;
   private currentPlayer?: StreamStartPayload['player'];
   private staticDelayUs = 0;
   private initialVolume: number;
@@ -121,6 +136,7 @@ export class SendspinClient {
   private audioChunkCallbacks = new Set<AudioChunkCallback>();
   private disconnectCallbacks = new Set<DisconnectCallback>();
   private serverCommandCallbacks = new Set<ServerCommandCallback>();
+  private sourceCommandCallbacks = new Set<SourceCommandCallback>();
 
   constructor(clientId: string, clientName: string, roles: Roles[], options: SendspinClientOptions = {}) {
     if (roles.includes(Roles.PLAYER) && !options.playerSupport) {
@@ -128,6 +144,9 @@ export class SendspinClient {
     }
     if (roles.includes(Roles.ARTWORK) && !options.artworkSupport) {
       throw new Error('artworkSupport is required when ARTWORK role is specified');
+    }
+    if (roles.includes(Roles.SOURCE) && !options.sourceSupport) {
+      throw new Error('sourceSupport is required when SOURCE role is specified');
     }
 
     this.clientId = clientId;
@@ -137,6 +156,7 @@ export class SendspinClient {
     this.playerSupport = options.playerSupport;
     this.artworkSupport = options.artworkSupport;
     this.visualizerSupport = options.visualizerSupport;
+    this.sourceSupport = options.sourceSupport;
     this.initialVolume = options.initialVolume ?? 100;
     this.initialMuted = options.initialMuted ?? false;
     this.setStaticDelayMs(options.staticDelayMs ?? 0);
@@ -234,12 +254,50 @@ export class SendspinClient {
     await this.sendMessage(message);
   }
 
+  async sendSourceState(state: SourceStatePayload): Promise<void> {
+    if (!this.isConnected) throw new Error('Client is not connected');
+    const message: ClientStateMessage = {
+      type: 'client/state',
+      payload: {
+        source: state,
+      },
+    };
+    await this.sendMessage(message);
+  }
+
   async sendGroupCommand(command: MediaCommand, opts: { volume?: number; mute?: boolean } = {}): Promise<void> {
     if (!this.isConnected) throw new Error('Client is not connected');
     const controllerPayload: ControllerCommandPayload = { command, volume: opts.volume, mute: opts.mute };
     const payload: ClientCommandPayload = { controller: controllerPayload };
     const message: ClientCommandMessage = { type: 'client/command', payload };
     await this.sendMessage(message);
+  }
+
+  async sendSourceCommand(command: SourceClientCommand): Promise<void> {
+    if (!this.isConnected) throw new Error('Client is not connected');
+    const payload: ClientCommandPayload = { source: { command } };
+    const message: ClientCommandMessage = { type: 'client/command', payload };
+    await this.sendMessage(message);
+  }
+
+  async sendSourceAudioChunk(
+    audioData: Buffer,
+    opts: { captureTimestampUs?: number; serverTimestampUs?: number } = {},
+  ): Promise<void> {
+    if (!this.isConnected) throw new Error('Client is not connected');
+    const { captureTimestampUs, serverTimestampUs } = opts;
+    let timestampUs = serverTimestampUs;
+    if (timestampUs == null) {
+      if (captureTimestampUs == null) {
+        throw new Error('captureTimestampUs or serverTimestampUs must be provided');
+      }
+      if (!this.timeFilter.isSynchronized) {
+        throw new Error('time sync not ready; provide serverTimestampUs explicitly');
+      }
+      timestampUs = this.computeSourceTimestamp(captureTimestampUs);
+    }
+    const header = packBinaryHeaderRaw(BinaryMessageType.SOURCE_AUDIO_CHUNK, timestampUs);
+    await this.sendBinary(Buffer.concat([header, audioData]));
   }
 
   addMetadataListener(callback: MetadataCallback): () => void {
@@ -287,6 +345,11 @@ export class SendspinClient {
     return () => this.serverCommandCallbacks.delete(callback);
   }
 
+  addSourceCommandListener(callback: SourceCommandCallback): () => void {
+    this.sourceCommandCallbacks.add(callback);
+    return () => this.sourceCommandCallbacks.delete(callback);
+  }
+
   isTimeSynchronized(): boolean {
     return this.timeFilter.isSynchronized;
   }
@@ -302,6 +365,10 @@ export class SendspinClient {
   computeServerTime(clientTimestampUs: number): number {
     const adjusted = clientTimestampUs - this.staticDelayUs;
     return this.timeFilter.computeServerTime(adjusted);
+  }
+
+  computeSourceTimestamp(captureTimestampUs: number): number {
+    return this.timeFilter.computeServerTime(captureTimestampUs);
   }
 
   private async waitForServerHello(timeoutMs: number): Promise<void> {
@@ -329,6 +396,7 @@ export class SendspinClient {
       ['visualizer@v1_support']: this.roles.includes(Roles.VISUALIZER)
         ? this.visualizerSupport
         : undefined,
+      ['source@v1_support']: this.roles.includes(Roles.SOURCE) ? this.sourceSupport : undefined,
     };
     const message: ClientHelloMessage = { type: 'client/hello', payload };
     await this.sendMessage(message);
@@ -348,6 +416,13 @@ export class SendspinClient {
     }
     const data = JSON.stringify(message);
     this.ws.send(data);
+  }
+
+  private async sendBinary(payload: Buffer): Promise<void> {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+      throw new Error('WebSocket is not connected');
+    }
+    this.ws.send(payload);
   }
 
   private handleWsMessage(data: WebSocket.RawData): void {
@@ -437,16 +512,12 @@ export class SendspinClient {
     const player = message.payload.player;
     if (!player) return;
 
-    if (player.codec !== AudioCodec.PCM) {
-      // Only PCM supported in this Node client for now.
-      return;
-    }
-
     const isFormatUpdate = this.streamActive && this.currentPlayer;
     this.streamActive = true;
 
     const pcmFormat = new PCMFormat(player.sample_rate, player.channels, player.bit_depth);
-    this.configureAudioOutput(pcmFormat);
+    const codecHeader = player.codec_header ? Buffer.from(player.codec_header, 'base64') : undefined;
+    this.configureAudioOutput(new AudioFormat(player.codec, pcmFormat, codecHeader));
     this.currentPlayer = player;
 
     if (!isFormatUpdate) {
@@ -469,7 +540,7 @@ export class SendspinClient {
     if (!roles || roles.includes(Roles.PLAYER)) {
       this.streamActive = false;
       this.currentPlayer = undefined;
-      this.currentPCMFormat = undefined;
+      this.currentAudioFormat = undefined;
     }
     this.notifyStreamEnd(roles);
   }
@@ -511,17 +582,26 @@ export class SendspinClient {
         // ignore
       }
     }
+    if (payload.source) {
+      for (const cb of [...this.sourceCommandCallbacks]) {
+        try {
+          cb(payload.source);
+        } catch {
+          // ignore
+        }
+      }
+    }
   }
 
-  private configureAudioOutput(format: PCMFormat): void {
-    this.currentPCMFormat = format;
+  private configureAudioOutput(format: AudioFormat): void {
+    this.currentAudioFormat = format;
   }
 
   private handleAudioChunk(timestampUs: number, payload: Buffer): void {
-    if (!this.currentPCMFormat) return;
+    if (!this.currentAudioFormat) return;
     for (const cb of [...this.audioChunkCallbacks]) {
       try {
-        cb(timestampUs, payload, this.currentPCMFormat);
+        cb(timestampUs, payload, this.currentAudioFormat);
       } catch {
         // ignore individual callback failures
       }
@@ -608,7 +688,7 @@ export class SendspinClient {
     this.timeFilter.reset();
     this.serverInfo = undefined;
     this.streamActive = false;
-    this.currentPCMFormat = undefined;
+    this.currentAudioFormat = undefined;
     this.currentPlayer = undefined;
     this.notifyDisconnect();
   }

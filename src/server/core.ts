@@ -1,7 +1,15 @@
 import type { IncomingMessage } from 'node:http';
+import { URL } from 'node:url';
 import WebSocket from 'ws';
 
-import { ConnectionReason, type RoleName } from '../types.js';
+import {
+  ConnectionReason,
+  PlaybackStateType,
+  ServerCommandPayload,
+  SourceSignalType,
+  SourceStateType,
+  type RoleName,
+} from '../types.js';
 import { SendspinSession, type SendspinSessionHooks, type SendspinPcmFrame, type SendspinConnectionMeta, type PlayerFormat } from './session.js';
 
 /**
@@ -11,15 +19,22 @@ export class SendspinCore {
   private readonly sessionsBySocket = new Map<WebSocket, SendspinSession>();
   private readonly hooksByClientId = new Map<
     string,
-    { hooks: SendspinSessionHooks; context?: SendspinConnectionMeta & { reason?: 'cast-tunnel' } }
+    { hooks: SendspinSessionHooks; context?: SendspinConnectionMeta }
+  >();
+  private readonly leadStatsByClientId = new Map<
+    string,
+    { leadUs: number; targetLeadUs: number; bufferedBytes?: number; updatedAt: number }
   >();
 
   handleConnection(
     ws: WebSocket,
     req?: IncomingMessage | null,
-    connectionReason: ConnectionReason | 'cast-tunnel' = ConnectionReason.DISCOVERY,
+    connectionReason: ConnectionReason = ConnectionReason.DISCOVERY,
   ): void {
+    const meta = this.extractConnectionMetadata(req);
     const session = new SendspinSession(ws, req ?? null, connectionReason, {
+      zoneId: meta.zoneId,
+      playerId: meta.playerId,
       remote: req?.socket?.remoteAddress ?? null,
     });
     this.sessionsBySocket.set(ws, session);
@@ -52,7 +67,7 @@ export class SendspinCore {
   registerHooks(
     clientId: string,
     hooks: SendspinSessionHooks,
-    context?: SendspinConnectionMeta & { reason?: 'cast-tunnel' },
+    context?: SendspinConnectionMeta,
   ): void {
     this.hooksByClientId.set(clientId, { hooks, context });
     const session = this.getSession(clientId);
@@ -69,13 +84,34 @@ export class SendspinCore {
     }
   }
 
-  listClients(): Array<{ clientId: string | null; roles: RoleName[]; remote: string | null }> {
-    const items: Array<{ clientId: string | null; roles: RoleName[]; remote: string | null }> = [];
+  listClients(): Array<{
+    clientId: string | null;
+    name: string | null;
+    roles: RoleName[];
+    playbackState: PlaybackStateType;
+    remote: string | null;
+    sourceState: SourceStateType | null;
+    sourceSignal: SourceSignalType | null;
+  }> {
+    const items: Array<{
+      clientId: string | null;
+      name: string | null;
+      roles: RoleName[];
+      playbackState: PlaybackStateType;
+      remote: string | null;
+      sourceState: SourceStateType | null;
+      sourceSignal: SourceSignalType | null;
+    }> = [];
     for (const session of this.sessionsBySocket.values()) {
+      const sourceStatus = session.getSourceStatus();
       items.push({
         clientId: session.getClientId(),
+        name: session.getClientName(),
         roles: session.getRoles(),
-        remote: null,
+        remote: session.getRemoteAddress(),
+        playbackState: session.getDescriptor().playbackState,
+        sourceState: sourceStatus.state ?? null,
+        sourceSignal: sourceStatus.signal ?? null,
       });
     }
     return items;
@@ -125,7 +161,7 @@ export class SendspinCore {
 
   sendGroupUpdate(
     clientId: string,
-    playbackState: 'playing' | 'paused' | 'stopped',
+    playbackState: PlaybackStateType,
     groupId?: string,
     groupName?: string,
   ): void {
@@ -136,8 +172,15 @@ export class SendspinCore {
     this.getSession(clientId)?.sendMetadata(payload);
   }
 
-  sendServerCommand(clientId: string, payload: Parameters<SendspinSession['sendServerCommand']>[0]): void {
-    this.getSession(clientId)?.sendServerCommand(payload);
+  setClientMetadata(clientId: string, payload: Parameters<SendspinSession['sendMetadata']>[0]): void {
+    this.sendMetadata(clientId, payload);
+  }
+
+  sendServerCommand(
+    clientId: string,
+    payload: Parameters<SendspinSession['sendServerCommand']>[0] | ServerCommandPayload,
+  ): void {
+    this.getSession(clientId)?.sendServerCommand(payload as ServerCommandPayload);
   }
 
   sendArtworkStreamStart(clientId: string, channels: Parameters<SendspinSession['sendArtworkStreamStart']>[0]): void {
@@ -160,6 +203,19 @@ export class SendspinCore {
     this.getSession(clientId)?.sendControllerState(payload);
   }
 
+  setClientControllerState(clientId: string, payload: Parameters<SendspinSession['sendControllerState']>[0]): void {
+    this.sendControllerState(clientId, payload);
+  }
+
+  setClientPlaybackState(
+    clientId: string,
+    playbackState: PlaybackStateType,
+    groupId?: string,
+    groupName?: string,
+  ): void {
+    this.sendGroupUpdate(clientId, playbackState, groupId, groupName);
+  }
+
   getSessionByClientId(clientId: string): SendspinSession | undefined {
     return this.getSession(clientId);
   }
@@ -173,6 +229,30 @@ export class SendspinCore {
     return cap > 0 ? cap : null;
   }
 
+  setLeadStats(
+    clientId: string,
+    stats: { leadUs: number; targetLeadUs: number; bufferedBytes?: number },
+  ): void {
+    if (!clientId) return;
+    this.leadStatsByClientId.set(clientId, {
+      leadUs: stats.leadUs,
+      targetLeadUs: stats.targetLeadUs,
+      bufferedBytes: stats.bufferedBytes,
+      updatedAt: Date.now(),
+    });
+  }
+
+  clearLeadStats(clientId: string): void {
+    if (!clientId) return;
+    this.leadStatsByClientId.delete(clientId);
+  }
+
+  getLeadStats(
+    clientId: string,
+  ): { leadUs: number; targetLeadUs: number; bufferedBytes?: number; updatedAt: number } | null {
+    return this.leadStatsByClientId.get(clientId) ?? null;
+  }
+
   getArtworkChannels(
     clientId: string,
   ): ReturnType<SendspinSession['getArtworkChannels']> | null {
@@ -184,9 +264,37 @@ export class SendspinCore {
   }
 
   private getSession(clientId: string): SendspinSession | undefined {
+    let preferred: SendspinSession | undefined;
+    let fallback: SendspinSession | undefined;
     for (const session of this.sessionsBySocket.values()) {
-      if (session.getClientId() === clientId) return session;
+      if (session.getClientId() === clientId) {
+        if (session.getConnectionReason() === ConnectionReason.PLAYBACK && !preferred) {
+          preferred = session;
+        } else if (!fallback) {
+          fallback = session;
+        }
+      }
     }
-    return undefined;
+    return preferred ?? fallback;
+  }
+
+  private extractConnectionMetadata(
+    req?: IncomingMessage | null,
+  ): {
+    zoneId?: number;
+    playerId?: string;
+  } {
+    if (!req?.url) {
+      return {};
+    }
+    try {
+      const url = new URL(req.url, 'http://localhost');
+      const zoneStr = url.searchParams.get('zone');
+      const zoneId = zoneStr && Number.isFinite(Number(zoneStr)) ? Number(zoneStr) : undefined;
+      const playerId = url.searchParams.get('player') ?? undefined;
+      return { zoneId, playerId };
+    } catch {
+      return {};
+    }
   }
 }

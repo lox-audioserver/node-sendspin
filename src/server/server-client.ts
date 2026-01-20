@@ -8,12 +8,14 @@ import {
   ClientHelloMessage,
   ClientHelloPayload,
   ClientInboundMessage,
+  ClientGoodbyeMessage,
   ClientStateMessage,
   ClientStatePayload,
   ClientTimePayload,
   ClientTimeMessage,
   GroupUpdateServerMessage,
   GroupUpdateServerPayload,
+  PlaybackStateType,
   RoleName,
   Roles,
   ServerCommandMessage,
@@ -44,6 +46,7 @@ export interface ServerClientOptions {
   serverId: string;
   serverName: string;
   serverVersion?: number;
+  connectionReason?: ConnectionReason;
 }
 
 export interface ClientEventMap {
@@ -58,6 +61,13 @@ export class ServerClient extends EventEmitter {
   private readonly ws: WebSocket;
   private readonly opts: ServerClientOptions;
   private readonly defaultRoles: RoleName[];
+  private activeRoles: RoleName[] = [];
+  private ready = false;
+  private initialStateRequired = false;
+  private initialStateReceived = false;
+  private initialStateTimer: NodeJS.Timeout | null = null;
+  private identified = false;
+  private readonly maxBufferedSend = 1024 * 512;
 
   constructor(ws: WebSocket, opts: ServerClientOptions) {
     super();
@@ -76,7 +86,7 @@ export class ServerClient extends EventEmitter {
   }
 
   get roles(): RoleName[] {
-    return this.helloPayload?.supported_roles ?? this.defaultRoles;
+    return this.activeRoles.length ? this.activeRoles : this.helloPayload?.supported_roles ?? this.defaultRoles;
   }
 
   close(): void {
@@ -92,7 +102,7 @@ export class ServerClient extends EventEmitter {
       name: this.opts.serverName,
       version: this.opts.serverVersion ?? 1,
       active_roles: this.roles.length ? this.roles : this.defaultRoles,
-      connection_reason: ConnectionReason.DISCOVERY,
+      connection_reason: this.opts.connectionReason ?? ConnectionReason.DISCOVERY,
     };
     const msg: ServerHelloMessage = { type: 'server/hello', payload };
     this.sendJson(msg);
@@ -134,6 +144,15 @@ export class ServerClient extends EventEmitter {
     }
     const header = packBinaryHeaderRaw(BinaryMessageType.AUDIO_CHUNK, timestampUs);
     const payload = Buffer.concat([header, pcmData]);
+    if (this.ws.readyState !== WebSocket.OPEN) return;
+    if (this.ws.bufferedAmount > this.maxBufferedSend) {
+      setTimeout(() => {
+        if (this.ws.readyState === WebSocket.OPEN) {
+          this.ws.send(payload);
+        }
+      }, 5);
+      return;
+    }
     this.ws.send(payload);
   }
 
@@ -159,12 +178,17 @@ export class ServerClient extends EventEmitter {
       return;
     }
 
+    if (!this.ready && msg.type !== 'client/hello') {
+      this.closeWithReason('expected client/hello first');
+      return;
+    }
+
     switch (msg.type) {
       case 'client/hello': {
-        const hello = (msg as ClientHelloMessage).payload;
-        this.helloPayload = hello;
-        void this.sendHello();
-        this.emit('hello', hello);
+        if (this.ready) {
+          break;
+        }
+        this.handleClientHello((msg as ClientHelloMessage).payload);
         break;
       }
       case 'client/time': {
@@ -174,12 +198,26 @@ export class ServerClient extends EventEmitter {
       }
       case 'client/state': {
         const payload = (msg as ClientStateMessage).payload;
+        if (!this.initialStateReceived && this.initialStateRequired) {
+          this.initialStateReceived = true;
+          if (this.initialStateTimer) {
+            clearTimeout(this.initialStateTimer);
+            this.initialStateTimer = null;
+          }
+          this.maybeEmitHello();
+        }
         this.emit('state', payload);
         break;
       }
       case 'client/command': {
         const payload = (msg as { payload: ClientCommandPayload }).payload;
         this.emit('command', payload);
+        break;
+      }
+      case 'client/goodbye': {
+        const payload = (msg as ClientGoodbyeMessage).payload;
+        const reason = payload?.reason ? `client goodbye:${payload.reason}` : 'client goodbye';
+        this.closeWithReason(reason);
         break;
       }
       default:
@@ -207,6 +245,108 @@ export class ServerClient extends EventEmitter {
 
   private nowUs(): number {
     return Math.floor(performance.now() * 1000);
+  }
+
+  private handleClientHello(payload: ClientHelloPayload): void {
+    if (payload?.version !== 1) {
+      this.closeWithReason('invalid protocol version');
+      return;
+    }
+    const rawClientId = typeof payload?.client_id === 'string' ? payload.client_id.trim() : '';
+    if (!rawClientId) {
+      this.closeWithReason('missing client_id');
+      return;
+    }
+    const supportedRoles = Array.isArray(payload?.supported_roles) ? payload.supported_roles : [];
+    if (!supportedRoles.length) {
+      this.closeWithReason('missing supported_roles');
+      return;
+    }
+
+    const { activeRoles } = this.resolveActiveRoles(supportedRoles);
+    this.activeRoles = activeRoles;
+
+    const playerSupport = (payload as any)['player@v1_support'] ?? (payload as any).player_support ?? null;
+    const artworkSupport = (payload as any)['artwork@v1_support'] ?? (payload as any).artwork_support ?? null;
+    const visualizerSupport = (payload as any)['visualizer@v1_support'] ?? (payload as any).visualizer_support ?? null;
+    const sourceSupport = (payload as any)['source@v1_support'] ?? (payload as any).source_support ?? null;
+    if (this.activeRoles.includes(Roles.PLAYER) && !playerSupport) {
+      this.closeWithReason('missing player support');
+      return;
+    }
+    if (this.activeRoles.includes(Roles.ARTWORK) && !artworkSupport) {
+      this.closeWithReason('missing artwork support');
+      return;
+    }
+    if (this.activeRoles.includes(Roles.VISUALIZER) && !visualizerSupport) {
+      this.closeWithReason('missing visualizer support');
+      return;
+    }
+    if (this.activeRoles.includes(Roles.SOURCE) && !sourceSupport) {
+      this.closeWithReason('missing source support');
+      return;
+    }
+
+    this.helloPayload = payload;
+    this.ready = true;
+    void this.sendHello();
+    this.sendGroupUpdate({
+      playback_state: PlaybackStateType.STOPPED,
+      group_id: rawClientId,
+      group_name: rawClientId,
+    });
+    this.initialStateRequired = this.activeRoles.includes(Roles.PLAYER);
+    if (this.initialStateRequired) {
+      this.initialStateTimer = setTimeout(() => {
+        if (!this.initialStateReceived) {
+          this.closeWithReason('initial state timeout');
+        }
+      }, 5000);
+    } else {
+      this.maybeEmitHello();
+    }
+  }
+
+  private maybeEmitHello(): void {
+    if (this.identified || !this.helloPayload) return;
+    if (this.initialStateRequired && !this.initialStateReceived) return;
+    this.identified = true;
+    this.emit('hello', this.helloPayload);
+  }
+
+  private closeWithReason(reason: string): void {
+    if (this.initialStateTimer) {
+      clearTimeout(this.initialStateTimer);
+      this.initialStateTimer = null;
+    }
+    try {
+      this.ws.close(1008, reason);
+    } catch {
+      /* ignore */
+    }
+  }
+
+  private resolveActiveRoles(supportedRoles: RoleName[]): { activeRoles: RoleName[] } {
+    const serverSupported = new Set<RoleName>([
+      Roles.PLAYER,
+      Roles.CONTROLLER,
+      Roles.METADATA,
+      Roles.ARTWORK,
+      Roles.VISUALIZER,
+      Roles.SOURCE,
+    ]);
+    const activeRoles: RoleName[] = [];
+    const seenFamilies = new Set<string>();
+    for (const role of supportedRoles) {
+      if (typeof role !== 'string') continue;
+      const family = role.split('@')[0];
+      if (seenFamilies.has(family)) continue;
+      if (serverSupported.has(role)) {
+        activeRoles.push(role);
+        seenFamilies.add(family);
+      }
+    }
+    return { activeRoles };
   }
 }
 

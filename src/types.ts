@@ -10,6 +10,7 @@ export enum Roles {
   METADATA = 'metadata@v1',
   ARTWORK = 'artwork@v1',
   VISUALIZER = 'visualizer@v1',
+  SOURCE = 'source@v1',
 }
 
 export type RoleName = Roles | string;
@@ -20,6 +21,7 @@ export enum BinaryMessageType {
   ARTWORK_CHANNEL_1 = 9,
   ARTWORK_CHANNEL_2 = 10,
   ARTWORK_CHANNEL_3 = 11,
+  SOURCE_AUDIO_CHUNK = 12,
   VISUALIZATION_DATA = 16,
 }
 
@@ -33,6 +35,18 @@ export enum ClientStateType {
   SYNCHRONIZED = 'synchronized',
   ERROR = 'error',
   EXTERNAL_SOURCE = 'external_source',
+}
+
+export enum SourceStateType {
+  IDLE = 'idle',
+  STREAMING = 'streaming',
+  ERROR = 'error',
+}
+
+export enum SourceSignalType {
+  UNKNOWN = 'unknown',
+  PRESENT = 'present',
+  ABSENT = 'absent',
 }
 
 export enum PlaybackStateType {
@@ -66,6 +80,17 @@ export enum MediaCommand {
   SHUFFLE = 'shuffle',
   UNSHUFFLE = 'unshuffle',
   SWITCH = 'switch',
+  SELECT_SOURCE = 'select_source',
+}
+
+export enum SourceCommand {
+  START = 'start',
+  STOP = 'stop',
+}
+
+export enum SourceClientCommand {
+  STARTED = 'started',
+  STOPPED = 'stopped',
 }
 
 export enum PictureFormat {
@@ -116,6 +141,32 @@ export interface ClientHelloPlayerSupport {
   supported_formats: SupportedAudioFormat[];
   buffer_capacity: number;
   supported_commands: PlayerCommand[];
+}
+
+export interface SourceFormat {
+  codec: AudioCodec;
+  channels: number;
+  sample_rate: number;
+  bit_depth: number;
+}
+
+export interface SourceFeatures {
+  level?: boolean;
+  line_sense?: boolean;
+}
+
+export interface ClientHelloSourceSupport {
+  format: SourceFormat;
+  features?: SourceFeatures;
+}
+
+export interface SourceCommandPayload {
+  command: SourceCommand;
+  format?: SourceFormat;
+}
+
+export interface SourceClientCommandPayload {
+  command: SourceClientCommand;
 }
 
 export interface ArtworkChannel {
@@ -180,12 +231,22 @@ export interface ControllerCommandPayload {
   command: MediaCommand;
   volume?: number;
   mute?: boolean;
+  source_id?: string | null;
 }
 
 export interface ControllerStatePayload {
   supported_commands: MediaCommand[];
   volume: number;
   muted: boolean;
+  sources?: Array<{
+    id: string;
+    name: string;
+    state: SourceStateType;
+    signal?: SourceSignalType | null;
+    selected?: boolean | null;
+    last_event?: SourceClientCommand | null;
+    last_event_ts_us?: number | null;
+  }>;
 }
 
 export interface ClientHelloPayload {
@@ -197,6 +258,7 @@ export interface ClientHelloPayload {
   ['player@v1_support']?: ClientHelloPlayerSupport;
   ['artwork@v1_support']?: ClientHelloArtworkSupport;
   ['visualizer@v1_support']?: ClientHelloVisualizerSupport;
+  ['source@v1_support']?: ClientHelloSourceSupport;
 }
 
 export interface ClientHelloMessage {
@@ -219,9 +281,16 @@ export interface PlayerStatePayload {
   muted?: boolean;
 }
 
+export interface SourceStatePayload {
+  state: SourceStateType;
+  level?: number;
+  signal?: SourceSignalType;
+}
+
 export interface ClientStatePayload {
   state?: ClientStateType;
   player?: PlayerStatePayload;
+  source?: SourceStatePayload;
 }
 
 export interface ClientStateMessage {
@@ -231,6 +300,7 @@ export interface ClientStateMessage {
 
 export interface ClientCommandPayload {
   controller?: ControllerCommandPayload;
+  source?: SourceClientCommandPayload;
 }
 
 export interface ClientCommandMessage {
@@ -354,6 +424,7 @@ export interface PlayerCommandPayload {
 
 export interface ServerCommandPayload {
   player?: PlayerCommandPayload;
+  source?: SourceCommandPayload;
 }
 
 export interface ServerCommandMessage {
