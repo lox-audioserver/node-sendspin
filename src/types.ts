@@ -88,6 +88,15 @@ export enum SourceCommand {
   STOP = 'stop',
 }
 
+export enum SourceControl {
+  PLAY = 'play',
+  PAUSE = 'pause',
+  NEXT = 'next',
+  PREVIOUS = 'previous',
+  ACTIVATE = 'activate',
+  DEACTIVATE = 'deactivate',
+}
+
 export enum SourceClientCommand {
   STARTED = 'started',
   STOPPED = 'stopped',
@@ -157,11 +166,13 @@ export interface SourceFeatures {
 
 export interface ClientHelloSourceSupport {
   format: SourceFormat;
+  controls?: SourceControl[];
   features?: SourceFeatures;
 }
 
 export interface SourceCommandPayload {
-  command: SourceCommand;
+  command?: SourceCommand;
+  control?: SourceControl;
   format?: SourceFormat;
 }
 
