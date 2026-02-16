@@ -165,15 +165,20 @@ export interface SourceFeatures {
 }
 
 export interface ClientHelloSourceSupport {
-  format: SourceFormat;
+  supported_formats: SourceFormat[];
   controls?: SourceControl[];
   features?: SourceFeatures;
+}
+
+export interface SourceVadSettings {
+  threshold_db?: number;
+  hold_ms?: number;
 }
 
 export interface SourceCommandPayload {
   command?: SourceCommand;
   control?: SourceControl;
-  format?: SourceFormat;
+  vad?: SourceVadSettings;
 }
 
 export interface SourceClientCommandPayload {

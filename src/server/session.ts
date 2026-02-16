@@ -11,6 +11,8 @@ import {
   ClientStateMessage,
   ClientStateType,
   ClientHelloSourceSupport,
+  SourceControl,
+  SourceFormat,
   SourceStatePayload,
   SourceStateType,
   SourceSignalType,
@@ -233,7 +235,19 @@ export class SendspinSession {
   }
 
   getSourceSupport(): ClientHelloSourceSupport | null {
-    return this.sourceSupport ? { ...this.sourceSupport } : null;
+    if (!this.sourceSupport) {
+      return null;
+    }
+    return {
+      ...this.sourceSupport,
+      supported_formats: Array.isArray(this.sourceSupport.supported_formats)
+        ? this.sourceSupport.supported_formats.map((fmt) => ({ ...fmt }))
+        : this.sourceSupport.supported_formats,
+      features: this.sourceSupport.features ? { ...this.sourceSupport.features } : this.sourceSupport.features,
+      controls: Array.isArray(this.sourceSupport.controls)
+        ? [...this.sourceSupport.controls]
+        : this.sourceSupport.controls,
+    };
   }
 
   getBackpressureStats(): { drops: number; lastBytes: number; lastDropTs: number | null; recentDrops: number } {
@@ -397,7 +411,15 @@ export class SendspinSession {
       return;
     }
     this.playerSupport = playerSupport || {};
-    this.sourceSupport = sourceSupport ?? null;
+    this.sourceSupport = this.normalizeSourceSupport(sourceSupport);
+    if (this.roles.includes(Roles.SOURCE) && !this.sourceSupport) {
+      try {
+        this.ws.close(1008, 'invalid source support');
+      } catch {
+        /* ignore */
+      }
+      return;
+    }
     this.expectVolume = (this.playerSupport?.supported_commands ?? []).includes(PlayerCommand.VOLUME);
     this.expectMute = (this.playerSupport?.supported_commands ?? []).includes(PlayerCommand.MUTE);
     const artworkChannels = Array.isArray(artworkSupport?.channels) ? artworkSupport.channels : [];
@@ -813,6 +835,31 @@ export class SendspinSession {
     if (codec === AudioCodec.FLAC || codec === 'flac') return AudioCodec.FLAC;
     if (codec === AudioCodec.PCM || codec === 'pcm') return AudioCodec.PCM;
     return undefined;
+  }
+
+  private normalizeSourceSupport(raw: unknown): ClientHelloSourceSupport | null {
+    if (!raw || typeof raw !== 'object') {
+      return null;
+    }
+    const sourceSupport = raw as {
+      supported_formats?: SourceFormat[];
+      controls?: SourceControl[];
+      features?: { level?: boolean; line_sense?: boolean };
+    };
+    const supportedFormats = Array.isArray(sourceSupport.supported_formats)
+      ? sourceSupport.supported_formats.filter((fmt): fmt is SourceFormat => Boolean(fmt))
+      : [];
+    if (!supportedFormats.length) {
+      return null;
+    }
+    const normalized: ClientHelloSourceSupport = {
+      supported_formats: supportedFormats,
+      ...(Array.isArray(sourceSupport.controls) ? { controls: [...sourceSupport.controls] } : {}),
+      ...(sourceSupport.features && typeof sourceSupport.features === 'object'
+        ? { features: { ...sourceSupport.features } }
+        : {}),
+    };
+    return normalized;
   }
 
   private resolveActiveRoles(
