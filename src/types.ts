@@ -10,19 +10,19 @@ export enum Roles {
   METADATA = 'metadata@v1',
   ARTWORK = 'artwork@v1',
   /**
-   * Visualizer role tracks the upstream Sendspin spec, which still ships the
-   * visualizer role as a draft revision (`visualizer@_draft_r1`). Updating
-   * here keeps role negotiation working with spec-compliant clients
-   * (esphome, sendspin-cli, aiosendspin).
+   * Current spec revision of the visualizer role. Per-type binary frames
+   * (loudness/f_peak/spectrum/beat/peak/pitch, message types 16-21), and the
+   * only visualizer wire a current client advertises.
    */
-  VISUALIZER = 'visualizer@_draft_r1',
-  /**
-   * Current spec revision of the visualizer role. Uses per-type binary frames
-   * (loudness/f_peak/spectrum/beat/peak/pitch, message types 16-21) rather
-   * than the draft's batched DATA blob. The latest sendspin-cli advertises
-   * only this version and hides its panel unless the server activates it.
-   */
+  VISUALIZER = 'visualizer@v1',
+  /** @deprecated Alias of {@link Roles.VISUALIZER}, kept for callers on the old name. */
   VISUALIZER_V1 = 'visualizer@v1',
+  /**
+   * Legacy visualizer wire: one batched DATA blob per frame at message type 16,
+   * and `batch_max` where v1 has `rate_max`. The reference server excludes it
+   * from negotiation in strict mode; kept here for esphome.
+   */
+  VISUALIZER_DRAFT_R1 = 'visualizer@_draft_r1',
   /**
    * Outbound-only role: the server pushes a color palette derived from the
    * current artwork via `server/state`. No client/hello support object is
@@ -30,9 +30,9 @@ export enum Roles {
    */
   COLOR = 'color@v1',
   /**
-   * Vendor extension (Lox-Audioserver only): used to receive line-in audio
-   * from ESPHome devices via SOURCE_AUDIO_CHUNK. Not part of the upstream
-   * Sendspin spec — keep aware of this when bumping protocol versions.
+   * Captures audio from a local input and streams it to the server, which does
+   * the resampling and distribution. Spec since aiosendspin 8.0.0; the format is
+   * announced with `client_stream/start`, not in the hello support object.
    */
   SOURCE = 'source@v1',
 }
@@ -45,7 +45,7 @@ export enum BinaryMessageType {
   ARTWORK_CHANNEL_1 = 9,
   ARTWORK_CHANNEL_2 = 10,
   ARTWORK_CHANNEL_3 = 11,
-  /** Vendor extension: not in upstream spec. Used for line-in ingest. */
+  /** One encoded audio frame captured by a source client (Source role, slot 0). */
   SOURCE_AUDIO_CHUNK = 12,
   /**
    * Slot 16 is shared: the legacy `visualizer@_draft_r1` wire sends a batched
@@ -117,7 +117,10 @@ export enum MediaCommand {
   SHUFFLE = 'shuffle',
   UNSHUFFLE = 'unshuffle',
   SWITCH = 'switch',
-  SELECT_SOURCE = 'select_source',
+  /** Absolute seek. Carries `position_ms`; only offered when `seek_max_ms` is set. */
+  SEEK = 'seek',
+  /** Relative seek. Carries a signed `offset_ms`. */
+  SEEK_RELATIVE = 'seek_relative',
 }
 
 export enum SourceCommand {
@@ -161,6 +164,39 @@ export enum GoodbyeReason {
   SHUTDOWN = 'shutdown',
   RESTART = 'restart',
   USER_REQUEST = 'user_request',
+  /** The server asked for an activity this client's trust level does not permit. */
+  UNAUTHORIZED = 'unauthorized',
+  /** The server asked for playback, but this client requires pairing first. */
+  PAIRING_REQUIRED = 'pairing_required',
+  /** Rejected because another connection is already admitted. */
+  CONCURRENT_ATTEMPT = 'concurrent_attempt',
+  /** The client processed `server/unpair` from this server. */
+  UNPAIRED = 'unpaired',
+}
+
+/**
+ * Reasons a reconnect is pointless: the client is telling us it will not accept
+ * this server as it stands, so retrying just produces the same refusal. `RESTART`
+ * is deliberately absent — a restarting client is expected back.
+ */
+export const TERMINAL_GOODBYE_REASONS: readonly GoodbyeReason[] = [
+  GoodbyeReason.ANOTHER_SERVER,
+  GoodbyeReason.SHUTDOWN,
+  GoodbyeReason.USER_REQUEST,
+  GoodbyeReason.UNAUTHORIZED,
+  GoodbyeReason.PAIRING_REQUIRED,
+  GoodbyeReason.UNPAIRED,
+];
+
+/**
+ * Trust a client extends to this server, as declared in `client/hello`. It is the
+ * client's judgement of us, not ours of it, and governs which management
+ * operations we may ask for. `none` is the honest answer on any unpaired
+ * connection, which is every connection until a pairing exchange has happened.
+ */
+export enum TrustLevel {
+  NONE = 'none',
+  USER = 'user',
 }
 
 export type UndefinedField = typeof UNDEFINED_FIELD;
@@ -201,8 +237,17 @@ export interface SourceFeatures {
   line_sense?: boolean;
 }
 
+/**
+ * `source@v1_support` from client/hello.
+ *
+ * The spec object is `features` alone — the stream format is announced per stream
+ * with `client_stream/start`, not up front. `supported_formats` and `controls` are
+ * vendor additions this server still accepts (and the line-in path still uses when
+ * a client offers them), so they are optional: a spec-conformant source sends
+ * neither and must not be rejected for it.
+ */
 export interface ClientHelloSourceSupport {
-  supported_formats: SourceFormat[];
+  supported_formats?: SourceFormat[];
   controls?: SourceControl[];
   features?: SourceFeatures;
 }
@@ -220,6 +265,32 @@ export interface SourceCommandPayload {
 
 export interface SourceClientCommandPayload {
   command: SourceClientCommand;
+}
+
+/** `source` object in `client_stream/start`: the format the source is about to send. */
+export interface ClientStreamStartSource {
+  codec: AudioCodec;
+  channels: number;
+  sample_rate: number;
+  bit_depth: number;
+  /** Standard Base64 codec header, when the codec needs one. */
+  codec_header?: string | null;
+}
+
+export interface ClientStreamStartPayload {
+  source: ClientStreamStartSource;
+}
+
+/** Client -> Server: a source client announces its active input stream format. */
+export interface ClientStreamStartMessage {
+  type: 'client_stream/start';
+  payload: ClientStreamStartPayload;
+}
+
+/** Client -> Server: a source client ends its input stream. Payload-less per spec. */
+export interface ClientStreamEndMessage {
+  type: 'client_stream/end';
+  payload?: Record<string, never>;
 }
 
 export interface ArtworkChannel {
@@ -284,13 +355,28 @@ export interface ControllerCommandPayload {
   command: MediaCommand;
   volume?: number;
   mute?: boolean;
-  source_id?: string | null;
+  /** Absolute position in ms. Set only when `command` is `seek`. */
+  position_ms?: number;
+  /** Signed offset in ms from the current position. Set only when `command` is `seek_relative`. */
+  offset_ms?: number;
 }
 
 export interface ControllerStatePayload {
   supported_commands: MediaCommand[];
   volume: number;
   muted: boolean;
+  /**
+   * Repeat mode of the group. Required by the spec since it moved out of the
+   * metadata object; a client that has to guess it renders a stale button.
+   */
+  repeat: RepeatMode;
+  /** Shuffle state of the group. Required alongside {@link repeat}. */
+  shuffle: boolean;
+  /**
+   * Highest absolute position (ms) a `seek` may target. Set only when `seek` is in
+   * `supported_commands`, and omitted for a stream with no seekable extent.
+   */
+  seek_max_ms?: number;
   sources?: Array<{
     id: string;
     name: string;
@@ -302,18 +388,36 @@ export interface ControllerStatePayload {
   }>;
 }
 
+/** A pairing method a client offers in `client/hello`. */
+export interface PairMethodDescriptor {
+  method: string;
+  channels?: string[];
+  min_pin_length?: number;
+  locations?: string[];
+}
+
+export interface UnpairedAccess {
+  enabled: boolean;
+}
+
 export interface ClientHelloPayload {
   client_id: string;
   name: string;
   version: number;
   supported_roles: RoleName[];
   device_info?: DeviceInfo;
+  /** The client's own trust judgement of this server. Defaults to `none` when absent. */
+  trust_level?: TrustLevel;
+  /** Pairing methods the client offers. Omitted by a client that cannot pair. */
+  supported_pair_methods?: PairMethodDescriptor[];
+  /** Whether the client currently admits playback without pairing. */
+  unpaired_access?: UnpairedAccess;
   ['player@v1_support']?: ClientHelloPlayerSupport;
   ['artwork@v1_support']?: ClientHelloArtworkSupport;
-  /** Current spec key: `visualizer@_draft_r1_support`. */
-  ['visualizer@_draft_r1_support']?: ClientHelloVisualizerSupport;
-  /** Legacy compat key for clients still emitting the old `visualizer@v1` role. */
+  /** Support object for the current `visualizer@v1` role. */
   ['visualizer@v1_support']?: ClientHelloVisualizerSupport;
+  /** Support object for the legacy `visualizer@_draft_r1` wire. */
+  ['visualizer@_draft_r1_support']?: ClientHelloVisualizerSupport;
   ['source@v1_support']?: ClientHelloSourceSupport;
 }
 
@@ -371,6 +475,16 @@ export interface SourceStatePayload {
 }
 
 export interface ClientStatePayload {
+  /**
+   * Whether the client is available to take part in playback.
+   *
+   * `false` says its output is in use by something else — an HDMI input, a local
+   * app — so no audio should be scheduled there. Supersedes {@link state}, which
+   * could only express the same thing and nothing more. Prefer this field; fall
+   * back to `state !== 'external_source'` for a client that only sends the enum.
+   */
+  available?: boolean;
+  /** @deprecated Superseded by {@link available}. Still read as a fallback. */
   state?: ClientStateType;
   player?: PlayerStatePayload;
   source?: SourceStatePayload;
@@ -403,6 +517,20 @@ export interface ClientGoodbyeMessage {
 export interface StreamRequestFormatPayload {
   player?: StreamRequestFormatPlayer;
   artwork?: StreamRequestFormatArtwork;
+  visualizer?: StreamRequestFormatVisualizer;
+}
+
+/**
+ * Visualizer renegotiation. Every field is optional and an omitted one keeps its
+ * current value, so a request that only lowers `buffer_capacity` leaves the
+ * negotiated types and rate alone.
+ */
+export interface StreamRequestFormatVisualizer {
+  types?: VisualizerType[];
+  rate_max?: number;
+  /** New ceiling on buffered visualizer bytes — the one setting a client may need to lower mid-stream. */
+  buffer_capacity?: number;
+  spectrum?: VisualizerSpectrumConfig;
 }
 
 export interface StreamRequestFormatMessage {
@@ -517,7 +645,20 @@ export interface StreamStartPlayer {
   codec_header?: string | null;
 }
 
-export interface StreamStartPayload {
+/**
+ * When the server put a stream trigger on the wire, in its own clock, microseconds.
+ *
+ * This is the start of the window a player's `required_lead_time_ms` is measured
+ * over: the spec counts the lead from here to the playback timestamp of the first
+ * chunk that can play in full. Without it a client can state a lead requirement but
+ * never tell whether it was honoured. Stamped at send on `stream/start`,
+ * `stream/clear` and `stream/end`.
+ */
+export interface StreamTriggerTimestamp {
+  server_transmitted: number;
+}
+
+export interface StreamStartPayload extends StreamTriggerTimestamp {
   player?: StreamStartPlayer;
   artwork?: StreamStartArtwork;
   visualizer?: StreamStartVisualizer;
@@ -528,7 +669,7 @@ export interface StreamStartMessage {
   payload: StreamStartPayload;
 }
 
-export interface StreamClearPayload {
+export interface StreamClearPayload extends StreamTriggerTimestamp {
   roles?: RoleName[];
 }
 
@@ -537,7 +678,7 @@ export interface StreamClearMessage {
   payload: StreamClearPayload;
 }
 
-export interface StreamEndPayload {
+export interface StreamEndPayload extends StreamTriggerTimestamp {
   roles?: RoleName[];
 }
 
@@ -564,12 +705,20 @@ export interface ServerCommandMessage {
   payload: ServerCommandPayload;
 }
 
+/** Role families that maintain a client-side buffer, so `stream/clear` applies to them. */
+export const STREAM_CLEAR_ROLE_FAMILIES: readonly string[] = ['player', 'visualizer'];
+
+/** Role families that receive a stream, so `stream/end` applies to them. */
+export const STREAM_END_ROLE_FAMILIES: readonly string[] = ['player', 'artwork', 'visualizer'];
+
 export type ClientOutboundMessage =
   | ClientHelloMessage
   | ClientTimeMessage
   | ClientStateMessage
   | ClientCommandMessage
   | ClientGoodbyeMessage
+  | ClientStreamStartMessage
+  | ClientStreamEndMessage
   | StreamRequestFormatMessage;
 
 export type ServerInboundMessage =
@@ -598,4 +747,6 @@ export type ClientInboundMessage =
   | ClientStateMessage
   | ClientCommandMessage
   | ClientGoodbyeMessage
+  | ClientStreamStartMessage
+  | ClientStreamEndMessage
   | StreamRequestFormatMessage;

@@ -11,10 +11,11 @@ import {
   ClientStateMessage,
   ClientStateType,
   ClientHelloSourceSupport,
+  ClientStreamStartMessage,
+  ClientStreamStartSource,
   SupportedAudioFormat,
   SourceControl,
   SourceFormat,
-  SourceStatePayload,
   SourceStateType,
   SourceSignalType,
   ClientTimeMessage,
@@ -38,13 +39,20 @@ import {
   VisualizerType,
   ServerTimeMessage,
   StreamClearMessage,
+  StreamClearPayload,
   StreamEndMessage,
+  StreamEndPayload,
   StreamRequestFormatMessage,
   StreamRequestFormatPayload,
   StreamStartMessage,
   StreamStartPayload,
   StreamStartPlayer,
   SourceClientCommand,
+  STREAM_CLEAR_ROLE_FAMILIES,
+  STREAM_END_ROLE_FAMILIES,
+  TrustLevel,
+  UnpairedAccess,
+  VisualizerSpectrumConfig,
 } from '../types.js';
 import { serverNowUs } from './clock.js';
 
@@ -76,6 +84,15 @@ export type PlayerFormatWithBitDepth<T extends number = number> =
 export interface SendspinPlayerStateUpdate {
   clientId: string | null;
   roles: RoleName[];
+  /**
+   * Whether the client is available for playback, as it last reported.
+   *
+   * Resolved from `available` when the client sends it, and from the legacy
+   * `state` enum otherwise, so a consumer never has to know which spelling
+   * arrived. Undefined only while a client has said nothing either way.
+   */
+  available?: boolean;
+  /** @deprecated Raw legacy enum, present only when the client sent it. Prefer {@link available}. */
   state?: ClientStateType;
   volume?: number;
   muted?: boolean;
@@ -99,6 +116,10 @@ export interface SendspinGroupCommand {
   command: MediaCommand;
   volume?: number;
   mute?: boolean;
+  /** Absolute target position in ms, on a `seek`. */
+  positionMs?: number;
+  /** Signed offset in ms, on a `seek_relative`. */
+  offsetMs?: number;
 }
 
 export interface SendspinSourceStateUpdate {
@@ -120,12 +141,35 @@ export interface SendspinSourceAudioChunk {
   data: Buffer;
 }
 
+/** The format a source client announced with `client_stream/start`. */
+export interface SendspinSourceStreamFormat {
+  codec: AudioCodec;
+  sampleRate: number;
+  channels: number;
+  bitDepth: number;
+  codecHeader?: string;
+}
+
 export interface SendspinSessionHooks {
   onPlayerState?: (session: SendspinSession, update: SendspinPlayerStateUpdate) => void;
   onGroupCommand?: (session: SendspinSession, command: SendspinGroupCommand) => void;
   onSourceState?: (session: SendspinSession, update: SendspinSourceStateUpdate) => void;
   onSourceCommand?: (session: SendspinSession, command: SendspinSourceCommand) => void;
   onSourceAudio?: (session: SendspinSession, chunk: SendspinSourceAudioChunk) => void;
+  /**
+   * A source client announced (or re-announced) its input stream format via
+   * `client_stream/start`. Fires before any audio for that stream arrives, so a
+   * consumer can stand up its ingest with the real format instead of guessing.
+   */
+  onSourceStreamStart?: (session: SendspinSession, format: SendspinSourceStreamFormat) => void;
+  /** A source client ended its input stream via `client_stream/end`. */
+  onSourceStreamEnd?: (session: SendspinSession) => void;
+  /**
+   * The visualizer client renegotiated its stream via `stream/request-format`.
+   * The new config has already been echoed back in a fresh `stream/start`; the
+   * consumer needs it to re-pace or re-shape what it feeds in.
+   */
+  onVisualizerFormatChanged?: (session: SendspinSession, config: VisualizerStreamConfig) => void;
   onIdentified?: (session: SendspinSession, req: IncomingMessage | null) => void;
   onDisconnected?: (session: SendspinSession) => void;
   onFormatChanged?: (session: SendspinSession, format: PlayerFormat) => void;
@@ -151,6 +195,8 @@ export class SendspinSession {
     height: number;
   }> = [];
   private visualizerSupport: VisualizerSupport | null = null;
+  /** Last visualizer@v1 config we announced, so a renegotiation can patch it. */
+  private visualizerStreamConfig: VisualizerStreamConfig | null = null;
   private expectVolume = false;
   private expectMute = false;
   private warnedMissingVolume = false;
@@ -167,6 +213,12 @@ export class SendspinSession {
   private lastStateSignature: string | null = null;
   private sourceState: SourceStateType | null = null;
   private sourceSignal: SourceSignalType | null = null;
+  /** Format from the source's last `client_stream/start`, cleared on `client_stream/end`. */
+  private sourceStreamFormat: SendspinSourceStreamFormat | null = null;
+  /** Availability as last reported, resolved across `available` and the legacy enum. */
+  private available: boolean | undefined;
+  private trustLevel: TrustLevel = TrustLevel.NONE;
+  private unpairedAccess = false;
 
   private hooks: SendspinSessionHooks = {};
   private hooksAttached = false;
@@ -286,6 +338,25 @@ export class SendspinSession {
     return { state: this.sourceState, signal: this.sourceSignal };
   }
 
+  /**
+   * Whether the client last reported itself available for playback, or undefined
+   * if it has said nothing either way. Resolved across `available` and the legacy
+   * `state` enum.
+   */
+  isAvailable(): boolean | undefined {
+    return this.available;
+  }
+
+  /** The format the source announced with `client_stream/start`, or null when no stream is up. */
+  getSourceStreamFormat(): SendspinSourceStreamFormat | null {
+    return this.sourceStreamFormat ? { ...this.sourceStreamFormat } : null;
+  }
+
+  /** What the client said in its hello about trust and unpaired access. */
+  getTrust(): { trustLevel: TrustLevel; unpairedAccess: boolean } {
+    return { trustLevel: this.trustLevel, unpairedAccess: this.unpairedAccess };
+  }
+
   getSourceSupport(): ClientHelloSourceSupport | null {
     if (!this.sourceSupport) {
       return null;
@@ -388,6 +459,12 @@ export class SendspinSession {
       case 'client/goodbye':
         this.handleClientGoodbye((msg as ClientGoodbyeMessage).payload);
         break;
+      case 'client_stream/start':
+        this.handleClientStreamStart((msg as ClientStreamStartMessage).payload);
+        break;
+      case 'client_stream/end':
+        this.handleClientStreamEnd();
+        break;
       case 'stream/request-format':
         this.handleStreamRequestFormat((msg as StreamRequestFormatMessage).payload);
         break;
@@ -450,9 +527,21 @@ export class SendspinSession {
     this.roles = activeRoles;
     const playerSupport = payload['player@v1_support'] ?? payload.player_support ?? null;
     const artworkSupport = payload['artwork@v1_support'] ?? payload.artwork_support ?? null;
+    /*
+     * Read the support object that belongs to the visualizer role we actually
+     * activated, not whichever key happens to be present.
+     *
+     * A client may advertise both wires — that is what the draft compat path
+     * exists for — and the two support objects have different shapes (v1 has
+     * `types`/`rate_max`, the draft has `batch_max` and puts the rate inside
+     * `spectrum`). Reading the draft object for a negotiated v1 role yielded
+     * `types: []`, so nothing was negotiated at all.
+     */
+    const activatedDraftVisualizer = this.roles.includes(Roles.VISUALIZER_DRAFT_R1);
     const visualizerSupport =
-      payload['visualizer@_draft_r1_support'] ??
-      payload['visualizer@v1_support'] ??
+      (activatedDraftVisualizer
+        ? payload['visualizer@_draft_r1_support']
+        : payload['visualizer@v1_support']) ??
       payload.visualizer_support ??
       null;
     const sourceSupport = payload['source@v1_support'] ?? payload.source_support ?? null;
@@ -473,7 +562,7 @@ export class SendspinSession {
       return;
     }
     if (
-      (this.roles.includes(Roles.VISUALIZER) || this.roles.includes(Roles.VISUALIZER_V1)) &&
+      (this.roles.includes(Roles.VISUALIZER) || activatedDraftVisualizer) &&
       !visualizerSupport
     ) {
       try {
@@ -493,14 +582,8 @@ export class SendspinSession {
     }
     this.playerSupport = playerSupport || {};
     this.sourceSupport = this.normalizeSourceSupport(sourceSupport);
-    if (this.roles.includes(Roles.SOURCE) && !this.sourceSupport) {
-      try {
-        this.ws.close(1008, 'invalid source support');
-      } catch {
-        /* ignore */
-      }
-      return;
-    }
+    this.trustLevel = payload?.trust_level === TrustLevel.USER ? TrustLevel.USER : TrustLevel.NONE;
+    this.unpairedAccess = (payload?.unpaired_access as UnpairedAccess | undefined)?.enabled === true;
     this.expectVolume = (this.playerSupport?.supported_commands ?? []).includes(PlayerCommand.VOLUME);
     this.expectMute = (this.playerSupport?.supported_commands ?? []).includes(PlayerCommand.MUTE);
     const artworkChannels = Array.isArray(artworkSupport?.channels) ? artworkSupport.channels : [];
@@ -512,7 +595,7 @@ export class SendspinSession {
         height: typeof c?.media_height === 'number' ? c.media_height : 800,
       }));
     }
-    if (this.roles.includes(Roles.VISUALIZER_V1) && visualizerSupport) {
+    if (this.roles.includes(Roles.VISUALIZER) && visualizerSupport) {
       this.visualizerSupport = this.parseVisualizerSupport(visualizerSupport);
     }
     this.initialStateRequired = this.roles.includes(Roles.PLAYER);
@@ -558,6 +641,20 @@ export class SendspinSession {
           ? (payload.player.state as ClientStateType)
           : undefined;
     /*
+     * Resolve availability across both spellings, preferring the boolean.
+     *
+     * `available` replaced the `state` enum, which could only ever say "busy
+     * elsewhere" and nothing else. Current clients send both during the
+     * transition, older ones only the enum, and a spec-conformant one will
+     * eventually send only the boolean — reading just one field means a client
+     * that reports being busy is heard by nobody.
+     */
+    if (typeof payload.available === 'boolean') {
+      this.available = payload.available;
+    } else if (state !== undefined) {
+      this.available = state !== ClientStateType.EXTERNAL_SOURCE;
+    }
+    /*
      * Remember the timing fields rather than passing this message's copy through.
      *
      * They are REQUIRED in a player's initial state and omitted from later updates when unchanged,
@@ -577,6 +674,7 @@ export class SendspinSession {
     const update: SendspinPlayerStateUpdate = {
       clientId: this.clientId,
       roles,
+      available: this.available,
       state,
       volume: payload.player?.volume,
       muted: payload.player?.muted,
@@ -610,7 +708,13 @@ export class SendspinSession {
   }
 
   private handleClientCommand(payload: {
-    controller?: { command: MediaCommand; volume?: number; mute?: boolean };
+    controller?: {
+      command: MediaCommand;
+      volume?: number;
+      mute?: boolean;
+      position_ms?: number;
+      offset_ms?: number;
+    };
     source?: { command: SourceClientCommand };
   }): void {
     const roles = [...this.roles];
@@ -622,6 +726,8 @@ export class SendspinSession {
         command: controller.command,
         volume: controller.volume,
         mute: controller.mute,
+        ...(typeof controller.position_ms === 'number' ? { positionMs: controller.position_ms } : {}),
+        ...(typeof controller.offset_ms === 'number' ? { offsetMs: controller.offset_ms } : {}),
       };
       this.hooks.onGroupCommand?.(this, cmd);
     }
@@ -648,21 +754,63 @@ export class SendspinSession {
     }
   }
 
-  private handleStreamRequestFormat(payload: StreamRequestFormatPayload): void {
-    if (payload.player) {
-      if (!this.roles.includes(Roles.PLAYER)) {
-        return;
-      }
-      this.applyPlayerFormatRequest(payload.player);
+  /**
+   * A source client announced the format of the input stream it is about to send.
+   *
+   * The spec puts the source format here rather than in the hello support object, so
+   * this is the only place a conformant source states it — and it may restate a new
+   * one mid-session, which is why the format is replaced rather than merged.
+   */
+  private handleClientStreamStart(payload: { source?: ClientStreamStartSource }): void {
+    if (!this.roles.includes(Roles.SOURCE)) return;
+    const source = payload?.source;
+    const codec = this.normalizeCodec(source?.codec);
+    if (
+      !source
+      || !codec
+      || typeof source.sample_rate !== 'number' || source.sample_rate <= 0
+      || typeof source.channels !== 'number' || source.channels <= 0
+      || typeof source.bit_depth !== 'number' || source.bit_depth <= 0
+    ) {
+      return;
     }
-    if (payload.artwork) {
-      if (!this.roles.includes(Roles.ARTWORK)) {
-        return;
-      }
+    const format: SendspinSourceStreamFormat = {
+      codec,
+      sampleRate: source.sample_rate,
+      channels: source.channels,
+      bitDepth: source.bit_depth,
+      ...(typeof source.codec_header === 'string' ? { codecHeader: source.codec_header } : {}),
+    };
+    this.sourceStreamFormat = format;
+    this.hooks.onSourceStreamStart?.(this, format);
+  }
+
+  private handleClientStreamEnd(): void {
+    if (!this.roles.includes(Roles.SOURCE)) return;
+    this.sourceStreamFormat = null;
+    this.hooks.onSourceStreamEnd?.(this);
+  }
+
+  /*
+   * Answer only the roles the client actually asked about.
+   *
+   * This used to re-send the player stream/start for every request-format,
+   * whichever sub-object it carried, so an artwork- or visualizer-only request
+   * produced an unrequested player stream/start — a restart trigger the client
+   * never asked for.
+   */
+  private handleStreamRequestFormat(payload: StreamRequestFormatPayload): void {
+    if (payload.player && this.roles.includes(Roles.PLAYER)) {
+      this.applyPlayerFormatRequest(payload.player);
+      this.hooks.onFormatChanged?.(this, this.streamFormat);
+      this.sendStreamFormat();
+    }
+    if (payload.artwork && this.roles.includes(Roles.ARTWORK)) {
       this.applyArtworkFormatRequest(payload.artwork);
     }
-    this.hooks.onFormatChanged?.(this, this.streamFormat);
-    this.sendStreamFormat();
+    if (payload.visualizer && this.roles.includes(Roles.VISUALIZER)) {
+      this.applyVisualizerFormatRequest(payload.visualizer);
+    }
   }
 
   private sendServerHello(): void {
@@ -692,7 +840,7 @@ export class SendspinSession {
       bit_depth: merged.bitDepth,
       codec_header: merged.codecHeader,
     };
-    const payload: StreamStartPayload = { player };
+    const payload: StreamStartPayload = { server_transmitted: serverNowUs(), player };
     const message: StreamStartMessage = { type: 'stream/start', payload };
     this.activeStream = true;
     this.sendJson(message);
@@ -708,7 +856,7 @@ export class SendspinSession {
       bit_depth: merged.bitDepth,
       codec_header: merged.codecHeader,
     };
-    const payload: StreamStartPayload = { player };
+    const payload: StreamStartPayload = { server_transmitted: serverNowUs(), player };
     const message: StreamStartMessage = { type: 'stream/start', payload };
     this.activeStream = true;
     this.sendJson(message);
@@ -716,14 +864,10 @@ export class SendspinSession {
 
   sendStreamClear(roles?: RoleName[]): void {
     if (!this.ready) return;
-    // Per Sendspin spec, stream/clear only applies to roles that maintain
-    // client-side buffers: player and visualizer. Drop other entries rather
-    // than forwarding an invalid payload that the client would reject.
-    const filtered = roles?.filter((role) => {
-      const family = (typeof role === 'string' ? role : '').split('@')[0];
-      return family === 'player' || family === 'visualizer';
-    });
-    const payload = { roles: filtered as any };
+    const payload: StreamClearPayload = {
+      server_transmitted: serverNowUs(),
+      roles: this.filterStreamRoles(roles, STREAM_CLEAR_ROLE_FAMILIES),
+    };
     const message: StreamClearMessage = { type: 'stream/clear', payload };
     this.streamGeneration += 1;
     this.sendJson(message);
@@ -731,11 +875,32 @@ export class SendspinSession {
 
   sendStreamEnd(roles?: RoleName[]): void {
     if (!this.ready) return;
-    const payload = { roles: roles as any };
+    const payload: StreamEndPayload = {
+      server_transmitted: serverNowUs(),
+      roles: this.filterStreamRoles(roles, STREAM_END_ROLE_FAMILIES),
+    };
     const message: StreamEndMessage = { type: 'stream/end', payload };
     this.activeStream = false;
     this.streamGeneration += 1;
     this.sendJson(message);
+  }
+
+  /**
+   * Keep only the roles the given stream message applies to.
+   *
+   * `stream/clear` reaches roles that hold a buffer, `stream/end` roles that
+   * receive a stream; naming any other role makes the payload invalid, so drop
+   * the strays rather than have the client reject the whole message. An omitted
+   * list means "all applicable roles" and is passed through untouched.
+   */
+  private filterStreamRoles(
+    roles: RoleName[] | undefined,
+    families: readonly string[],
+  ): RoleName[] | undefined {
+    if (!roles) return undefined;
+    return roles.filter((role) =>
+      families.includes((typeof role === 'string' ? role : '').split('@')[0]),
+    );
   }
 
   sendPcmAudioFrame(frame: SendspinPcmFrame): void {
@@ -875,6 +1040,7 @@ export class SendspinSession {
     const message = {
       type: 'stream/start',
       payload: {
+        server_transmitted: serverNowUs(),
         artwork: {
           channels: channels.map((c) => ({
             source: c.source,
@@ -898,19 +1064,21 @@ export class SendspinSession {
     this.sendBinary(payload);
   }
 
+  /** Announce a legacy `visualizer@_draft_r1` stream (batched DATA blob wire). */
   sendVisualizerStreamStart(config: Record<string, any> = {}): void {
     if (!this.ready) return;
-    if (!this.roles.includes(Roles.VISUALIZER)) return;
+    if (!this.roles.includes(Roles.VISUALIZER_DRAFT_R1)) return;
     const message = {
       type: 'stream/start',
-      payload: { visualizer: { ...config } },
+      payload: { server_transmitted: serverNowUs(), visualizer: { ...config } },
     };
     this.sendJson(message as any);
   }
 
+  /** Send one batched `visualizer@_draft_r1` DATA blob. */
   sendVisualizerFrame(data: Buffer, timestampUs?: number): void {
     if (!this.ready) return;
-    if (!this.roles.includes(Roles.VISUALIZER)) return;
+    if (!this.roles.includes(Roles.VISUALIZER_DRAFT_R1)) return;
     const ts = timestampUs ?? serverNowUs();
     const header = packBinaryHeaderRaw(BinaryMessageType.VISUALIZATION_DATA, ts);
     this.sendBinary(Buffer.concat([header, data]));
@@ -941,7 +1109,7 @@ export class SendspinSession {
 
   /** Visualizer@v1 capabilities the client advertised, or null when not negotiated. */
   getVisualizerSupport(): VisualizerSupport | null {
-    return this.roles.includes(Roles.VISUALIZER_V1) ? this.visualizerSupport : null;
+    return this.roles.includes(Roles.VISUALIZER) ? this.visualizerSupport : null;
   }
 
   /**
@@ -950,20 +1118,26 @@ export class SendspinSession {
    */
   sendVisualizerStreamStartV1(config: VisualizerStreamConfig): void {
     if (!this.ready) return;
-    if (!this.roles.includes(Roles.VISUALIZER_V1)) return;
+    if (!this.roles.includes(Roles.VISUALIZER)) return;
     const visualizer: Record<string, unknown> = {
       types: config.types,
       rate_max: config.rate_max,
     };
     if (config.spectrum) visualizer.spectrum = config.spectrum;
     if (config.tracks_downbeats !== undefined) visualizer.tracks_downbeats = config.tracks_downbeats;
-    this.sendJson({ type: 'stream/start', payload: { visualizer } } as any);
+    // Kept so a later stream/request-format can be applied as the partial update it
+    // is, instead of having to rebuild a config the session never saw.
+    this.visualizerStreamConfig = { ...config };
+    this.sendJson({
+      type: 'stream/start',
+      payload: { server_transmitted: serverNowUs(), visualizer },
+    } as any);
   }
 
   /** Send one visualizer@v1 binary frame: `[type:1][ts:8][payload]`. */
   private sendVisualizerV1(type: BinaryMessageType, payload: Buffer, timestampUs?: number): void {
     if (!this.ready) return;
-    if (!this.roles.includes(Roles.VISUALIZER_V1)) return;
+    if (!this.roles.includes(Roles.VISUALIZER)) return;
     const ts = timestampUs ?? serverNowUs();
     this.sendBinary(Buffer.concat([packBinaryHeaderRaw(type, ts), payload]), { allowDrop: true });
   }
@@ -1023,6 +1197,43 @@ export class SendspinSession {
     this.streamFormat = merged;
   }
 
+  /**
+   * Apply a visualizer renegotiation and echo the result back.
+   *
+   * A partial update: omitted fields keep their current value. Requested types are
+   * intersected with what the client declared in its hello, since a renegotiation
+   * narrows the wire rather than widening what the client can decode.
+   */
+  private applyVisualizerFormatRequest(
+    request: NonNullable<StreamRequestFormatPayload['visualizer']>,
+  ): void {
+    const support = this.visualizerSupport;
+    const active = this.visualizerStreamConfig;
+    if (!support || !active) return;
+
+    if (Array.isArray(request.types)) {
+      const allowed = new Set(support.types);
+      const types = request.types.filter((type) => allowed.has(type));
+      if (types.length) {
+        active.types = types;
+      }
+    }
+    if (typeof request.rate_max === 'number' && request.rate_max > 0) {
+      active.rate_max = request.rate_max;
+      support.rate_max = request.rate_max;
+    }
+    if (typeof request.buffer_capacity === 'number' && request.buffer_capacity > 0) {
+      support.buffer_capacity = request.buffer_capacity;
+    }
+    if (request.spectrum) {
+      const spectrum: VisualizerSpectrumConfig = { ...request.spectrum };
+      active.spectrum = spectrum;
+      support.spectrum = spectrum;
+    }
+    this.sendVisualizerStreamStartV1(active);
+    this.hooks.onVisualizerFormatChanged?.(this, { ...active });
+  }
+
   private applyArtworkFormatRequest(request: StreamRequestFormatPayload['artwork']): void {
     if (!request || typeof request.channel !== 'number') return;
     const idx = Math.max(0, Math.min(3, Math.floor(request.channel)));
@@ -1077,6 +1288,14 @@ export class SendspinSession {
     return undefined;
   }
 
+  /**
+   * Normalize a `source@v1_support` object.
+   *
+   * The spec object carries `features` alone; a source announces its format per
+   * stream with `client_stream/start`. `supported_formats` and `controls` are vendor
+   * additions, so both are optional and an object without them is valid — rejecting
+   * a source for omitting `supported_formats` locked out every conformant client.
+   */
   private normalizeSourceSupport(raw: unknown): ClientHelloSourceSupport | null {
     if (!raw || typeof raw !== 'object') {
       return null;
@@ -1089,17 +1308,13 @@ export class SendspinSession {
     const supportedFormats = Array.isArray(sourceSupport.supported_formats)
       ? sourceSupport.supported_formats.filter((fmt): fmt is SourceFormat => Boolean(fmt))
       : [];
-    if (!supportedFormats.length) {
-      return null;
-    }
-    const normalized: ClientHelloSourceSupport = {
-      supported_formats: supportedFormats,
+    return {
+      ...(supportedFormats.length ? { supported_formats: supportedFormats } : {}),
       ...(Array.isArray(sourceSupport.controls) ? { controls: [...sourceSupport.controls] } : {}),
       ...(sourceSupport.features && typeof sourceSupport.features === 'object'
         ? { features: { ...sourceSupport.features } }
         : {}),
     };
-    return normalized;
   }
 
   private resolveActiveRoles(
@@ -1110,16 +1325,27 @@ export class SendspinSession {
       Roles.CONTROLLER,
       Roles.METADATA,
       Roles.ARTWORK,
-      Roles.VISUALIZER_V1,
       Roles.VISUALIZER,
+      Roles.VISUALIZER_DRAFT_R1,
       Roles.COLOR,
       Roles.SOURCE,
     ]);
+    /*
+     * Prefer the spec wire when a client offers both visualizer revisions.
+     *
+     * Activation is first-in-client-order per family, so a client listing the draft
+     * first would otherwise pin us to the legacy batched wire even though it also
+     * speaks v1. The reference server solves this by skipping legacy role IDs.
+     */
+    const legacyRolesToSkip = new Set<RoleName>(
+      supportedRoles.includes(Roles.VISUALIZER) ? [Roles.VISUALIZER_DRAFT_R1] : [],
+    );
     const activeRoles: RoleName[] = [];
     const unsupportedRoles: RoleName[] = [];
     const seenFamilies = new Set<string>();
     for (const role of supportedRoles) {
       if (typeof role !== 'string') continue;
+      if (legacyRolesToSkip.has(role)) continue;
       const family = role.split('@')[0];
       if (serverSupported.has(role)) {
         if (!seenFamilies.has(family)) {
