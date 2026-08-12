@@ -627,6 +627,16 @@ export class SendspinSession {
     this.authenticatedClientId = result.clientId;
     this.pskCategory = result.psk.category;
     this.clientId = result.clientId;
+    /*
+     * Encryption reverses the hello order: the server greets first, unprompted.
+     *
+     * The client waits for `server/hello` before sending its own, so a server that
+     * waits for the hello deadlocks both sides. It works out this way because the
+     * identity question is already settled — `server/init` carried the key the
+     * handshake then proved — so there is nothing left for the server to learn
+     * before it can name itself.
+     */
+    this.sendJson({ type: 'server/hello', payload: { name: this.serverName } });
   }
 
   handleBinary(data: WebSocket.RawData): void {
@@ -1030,17 +1040,17 @@ export class SendspinSession {
   }
 
   /**
-   * Identify the server, in whichever of the two shapes this connection uses.
+   * Answer the client's hello, in whichever shape this connection uses.
    *
-   * Under encryption `server/hello` is only `{name}` — identity came from
-   * `server/init` and the roles move to `server/activate`. The wider legacy shape
+   * Encrypted connections were already greeted right after the handshake, so what
+   * is owed here is `server/activate` — which is where everything the legacy hello
+   * used to carry now lives. The wider legacy shape
    * (`server_id`/`version`/`active_roles`/`connection_reason`) is transition-mode
    * only; the reference calls it `LegacyServerHelloMessage` and still accepts it.
    */
   private sendServerHello(): void {
     if (!this.roles.length) return;
     if (this.noisePhase === 'encrypted') {
-      this.sendJson({ type: 'server/hello', payload: { name: this.serverName } });
       this.sendServerActivate();
       return;
     }
