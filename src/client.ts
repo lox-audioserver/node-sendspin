@@ -233,7 +233,7 @@ export class SendspinClient {
       this.ws?.once('error', handleError);
     });
 
-    this.ws.on('message', (data) => this.handleWsMessage(data));
+    this.ws.on('message', (data, isBinary) => this.handleWsMessage(data, isBinary));
     this.ws.on('close', () => this.disconnect());
     this.ws.on('error', () => this.disconnect());
 
@@ -601,13 +601,22 @@ export class SendspinClient {
     this.ws.send(payload);
   }
 
-  private handleWsMessage(data: WebSocket.RawData): void {
+  /**
+   * Route one frame from the socket.
+   *
+   * `isBinary` is the only reliable way to tell a text frame from a binary one: `ws`
+   * hands both to the listener as a Buffer, so the `typeof data === 'string'` test
+   * this used was never true and every JSON message on an unencrypted connection was
+   * fed to the audio-chunk path instead. It went unnoticed because the app drives the
+   * server half, and the encrypted path reads its frames elsewhere.
+   */
+  private handleWsMessage(data: WebSocket.RawData, isBinary = true): void {
     if (this.transport) {
       this.handleEncryptedFrame(Buffer.from(data as Buffer));
       return;
     }
-    if (typeof data === 'string') {
-      void this.handleJsonMessage(data);
+    if (!isBinary) {
+      void this.handleJsonMessage(data.toString());
       return;
     }
     if (data instanceof Buffer || data instanceof Uint8Array) {
