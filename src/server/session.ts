@@ -175,6 +175,11 @@ export interface SendspinSessionHooks {
   onFormatChanged?: (session: SendspinSession, format: PlayerFormat) => void;
   onGoodbye?: (session: SendspinSession, reason: GoodbyeReason) => void;
   onUnsupportedRoles?: (session: SendspinSession, roles: RoleName[]) => void;
+  /**
+   * A client deviated from the spec and the session tolerated it. Fired once per
+   * distinct reason, so it is safe to log at warning level.
+   */
+  onNoncompliance?: (session: SendspinSession, reason: string) => void;
 }
 
 /**
@@ -219,6 +224,8 @@ export class SendspinSession {
   private available: boolean | undefined;
   private trustLevel: TrustLevel = TrustLevel.NONE;
   private unpairedAccess = false;
+  /** Deviations already reported, so a chatty client is flagged once per reason. */
+  private readonly flaggedNoncompliance = new Set<string>();
 
   private hooks: SendspinSessionHooks = {};
   private hooksAttached = false;
@@ -720,25 +727,52 @@ export class SendspinSession {
     const roles = [...this.roles];
     const controller = payload.controller;
     if (controller) {
-      const cmd: SendspinGroupCommand = {
-        clientId: this.clientId,
-        roles,
-        command: controller.command,
-        volume: controller.volume,
-        mute: controller.mute,
-        ...(typeof controller.position_ms === 'number' ? { positionMs: controller.position_ms } : {}),
-        ...(typeof controller.offset_ms === 'number' ? { offsetMs: controller.offset_ms } : {}),
-      };
-      this.hooks.onGroupCommand?.(this, cmd);
+      /*
+       * A role object only counts when that role is active.
+       *
+       * The reference dispatches client/command to the active roles alone, so a
+       * controller object from a client that never negotiated the controller role
+       * reaches nobody. We forwarded it regardless, which let a player-only client
+       * drive the group's transport and volume.
+       */
+      if (!this.roles.includes(Roles.CONTROLLER)) {
+        this.flagNoncompliance('client/command carried a controller object without the controller role');
+      } else {
+        const cmd: SendspinGroupCommand = {
+          clientId: this.clientId,
+          roles,
+          command: controller.command,
+          volume: controller.volume,
+          mute: controller.mute,
+          ...(typeof controller.position_ms === 'number' ? { positionMs: controller.position_ms } : {}),
+          ...(typeof controller.offset_ms === 'number' ? { offsetMs: controller.offset_ms } : {}),
+        };
+        this.hooks.onGroupCommand?.(this, cmd);
+      }
     }
     const source = payload.source;
-    if (source && this.hooks.onSourceCommand) {
+    if (source && !this.roles.includes(Roles.SOURCE)) {
+      this.flagNoncompliance('client/command carried a source object without the source role');
+    } else if (source && this.hooks.onSourceCommand) {
       this.hooks.onSourceCommand(this, {
         clientId: this.clientId,
         roles,
         command: source.command,
       });
     }
+  }
+
+  /**
+   * Record a client deviating from the spec, once per distinct reason.
+   *
+   * The reference funnels every backwards-compatibility tolerance through one place
+   * so a deviation is visible rather than silently absorbed. This is that place: we
+   * stay lenient on the wire, but the host gets told what was tolerated.
+   */
+  private flagNoncompliance(reason: string): void {
+    if (this.flaggedNoncompliance.has(reason)) return;
+    this.flaggedNoncompliance.add(reason);
+    this.hooks.onNoncompliance?.(this, reason);
   }
 
   private handleClientGoodbye(payload: ClientGoodbyeMessage['payload']): void {
@@ -1184,6 +1218,16 @@ export class SendspinSession {
     this.sendVisualizerV1(BinaryMessageType.VISUALIZATION_BEAT, Buffer.from([downbeat ? 0b1 : 0b0]), timestampUs);
   }
 
+  /**
+   * Apply a player format request, but only to a format the client can actually decode.
+   *
+   * A partial update merged onto the current format, then checked against the
+   * `supported_formats` from the client's hello. We honoured the merge unconditionally
+   * before, so a client could ask for — and be sent — a rate or depth it never
+   * declared, which surfaces at the far end as every packet failing to decode. The
+   * reference falls back to the format in force rather than refusing outright, and
+   * still re-announces, so the client learns what it is actually getting.
+   */
   private applyPlayerFormatRequest(request: StreamRequestFormatPayload['player']): void {
     if (!request) return;
     const codec = this.normalizeCodec(request.codec);
@@ -1194,7 +1238,28 @@ export class SendspinSession {
       ...(typeof request.channels === 'number' ? { channels: request.channels } : {}),
       ...(typeof request.bit_depth === 'number' ? { bitDepth: request.bit_depth } : {}),
     };
+    if (!this.isDeclaredFormat(merged)) {
+      this.flagNoncompliance(
+        'stream/request-format requested a format not in the client\'s declared supported_formats',
+      );
+      return;
+    }
     this.streamFormat = merged;
+  }
+
+  /** Whether a fully-resolved format appears in the client's declared `supported_formats`. */
+  private isDeclaredFormat(format: PlayerFormat): boolean {
+    const declared = this.getPlayerSupportedFormats();
+    // A client that declared nothing is already non-conformant; don't compound it by
+    // second-guessing the request on top.
+    if (!declared.length) return true;
+    return declared.some(
+      (fmt) =>
+        this.normalizeCodec(fmt.codec) === format.codec
+        && fmt.sample_rate === format.sampleRate
+        && fmt.channels === format.channels
+        && fmt.bit_depth === format.bitDepth,
+    );
   }
 
   /**
