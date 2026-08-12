@@ -196,6 +196,129 @@ export async function beginServerHandshake(options: {
   };
 }
 
+/**
+ * Given the `psk_id` message 1 named, return the matching PSK, or null to abort.
+ *
+ * A client with no pairing store recognises only the Sentinel PSK — which is what
+ * {@link defaultClientPskResolver} does.
+ */
+export type PskResolver = (pskId: string) => ResolvedPsk | null | Promise<ResolvedPsk | null>;
+
+/** Recognise the Sentinel PSK and nothing else: unpaired access, no stored credentials. */
+export const defaultClientPskResolver: PskResolver = (pskId) =>
+  pskId === SENTINEL_PSK_ID ? SENTINEL_RESOLVED : null;
+
+export interface ClientHandshakeResult extends Omit<HandshakeResult, 'clientId'> {
+  /** The server's static public key, base64url — its authenticated `server_id`. */
+  serverId: string;
+}
+
+/**
+ * Client-side (Noise responder) handshake.
+ *
+ * Mirror of the server driver: it returns the frames to send and a callback per
+ * incoming frame, so the caller keeps ownership of the socket.
+ *
+ * `expectedServerId` is what turns encryption into authentication. Without it the
+ * statics are only what this very connection claimed, so an active
+ * man-in-the-middle can substitute its own in both directions; a caller that has
+ * paired before should pass the id it stored.
+ */
+export function beginClientHandshake(options: {
+  identity: Identity;
+  suite: NoiseCipherSuite;
+  pskResolver?: PskResolver;
+  expectedServerId?: string;
+}): {
+  clientInit: string;
+  /** Feed `server/init`; returns nothing to send yet (message 1 comes next). */
+  onServerInit: (serverInitText: string) => void;
+  /** Feed Noise message 1; returns message 2 to send, and completes the handshake. */
+  onMessage1: (message1Text: string) => Promise<{ send: string; result: ClientHandshakeResult }>;
+} {
+  const { identity, suite, pskResolver = defaultClientPskResolver, expectedServerId } = options;
+  if (!SUPPORTED_SUITES.includes(suite)) {
+    throw new HandshakeAbortedError(`unsupported suite ${suite}`);
+  }
+  const clientInit = JSON.stringify({
+    type: 'client/init',
+    payload: { client_id: identity.peerId, version: NOISE_PROTOCOL_VERSION, suite },
+  });
+
+  let serverId: string | null = null;
+  let prologue: Buffer | null = null;
+  let session: NoiseSession | null = null;
+
+  return {
+    clientInit,
+    onServerInit: (serverInitText: string): void => {
+      const init = parseJson(serverInitText, 'server/init');
+      if (init.type !== 'server/init') {
+        throw new HandshakeAbortedError(`expected server/init, got ${String(init.type)}`);
+      }
+      const payload = (init.payload ?? {}) as Record<string, any>;
+      if (payload.version !== NOISE_PROTOCOL_VERSION) {
+        throw new HandshakeAbortedError(`unsupported protocol version ${String(payload.version)}`);
+      }
+      serverId = typeof payload.server_id === 'string' ? payload.server_id : '';
+      if (expectedServerId !== undefined && serverId !== expectedServerId) {
+        throw new HandshakeAbortedError(
+          `server_id mismatch: expected ${expectedServerId}, got ${serverId}`,
+        );
+      }
+      const serverStaticPub = peerIdToPublicKey(serverId, 'server_id');
+      prologue = Buffer.concat([
+        Buffer.from(clientInit, 'utf8'),
+        Buffer.from(serverInitText, 'utf8'),
+      ]);
+      // No PSK yet: KKpsk2 mixes it at message 2, and message 1 is what names it.
+      session = NoiseSession.asResponder({
+        suite,
+        localStaticPriv: identity.privateBytes,
+        remoteStaticPub: serverStaticPub,
+        prologue,
+      });
+    },
+    onMessage1: async (message1Text: string) => {
+      if (!session || !prologue || serverId === null) {
+        throw new HandshakeAbortedError('server/init has not been processed yet');
+      }
+      const parsed = parseJson(message1Text, 'noise/handshake');
+      if (parsed.type !== 'noise/handshake') {
+        throw new HandshakeAbortedError(`expected noise/handshake, got ${String(parsed.type)}`);
+      }
+      const data = (parsed.payload ?? {}).data;
+      if (typeof data !== 'string') {
+        throw new HandshakeAbortedError('malformed noise/handshake payload');
+      }
+      let plaintext: Buffer;
+      try {
+        plaintext = session.readMessage(b64urlDecode(data));
+      } catch {
+        throw new HandshakeAbortedError('Noise message 1 failed authentication');
+      }
+      const named = parseJson(plaintext.toString('utf8'), 'Noise message 1 payload');
+      const pskId = typeof named.psk_id === 'string' ? named.psk_id : '';
+      const resolved = await pskResolver(pskId);
+      if (!resolved) throw new HandshakeAbortedError(`no PSK matches psk_id=${pskId}`);
+      session.mixPsk(resolved.psk);
+      const message2 = session.writeMessage(Buffer.from('{}', 'utf8'));
+      return {
+        send: packHandshake(message2),
+        result: {
+          transport: new NoiseTransport(session),
+          session,
+          serverId,
+          suite,
+          psk: resolved,
+          handshakeHash: session.handshakeHash,
+          prologue,
+        },
+      };
+    },
+  };
+}
+
 function packHandshake(noiseBytes: Buffer): string {
   return JSON.stringify({
     type: 'noise/handshake',

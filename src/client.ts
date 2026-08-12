@@ -47,6 +47,10 @@ import {
 } from './types.js';
 import { BINARY_HEADER_SIZE, packBinaryHeaderRaw, unpackBinaryHeader } from './binary.js';
 import { SendspinTimeFilter } from './time-filter.js';
+import { beginClientHandshake, PskCategory, type PskResolver } from './noise/handshake.js';
+import type { Identity } from './noise/keys.js';
+import type { NoiseCipherSuite } from './noise/session.js';
+import { NoiseTransport } from './noise/wire.js';
 
 export type MetadataCallback = (payload: ServerStatePayload) => void;
 export type GroupUpdateCallback = (payload: GroupUpdateServerPayload) => void;
@@ -92,12 +96,36 @@ export interface SendspinClientOptions {
   staticDelayMs?: number;
   initialVolume?: number;
   initialMuted?: boolean;
+  /** Speak the encrypted path. Omit for a transition-mode (unencrypted) connection. */
+  encryption?: SendspinClientEncryption;
 }
 
 export interface ServerInfo {
   serverId: string;
   name: string;
   version: number;
+}
+
+/**
+ * Speak the encrypted path.
+ *
+ * `identity` is this client's long-term keypair; its public half becomes the
+ * `client_id` the server authenticates, so persist it — a new one each run is a new
+ * client, and any zone bound to the old id stops matching.
+ *
+ * `expectedServerId` is what turns encryption into authentication. Leave it unset
+ * and the connection is confidential against a passive listener but open to an
+ * active man-in-the-middle, since the statics are only what this connection
+ * claimed. Set it to the id you stored when you last paired.
+ *
+ * `pskResolver` defaults to recognising the Sentinel PSK alone, i.e. unpaired
+ * access.
+ */
+export interface SendspinClientEncryption {
+  identity: Identity;
+  suite?: NoiseCipherSuite;
+  pskResolver?: PskResolver;
+  expectedServerId?: string;
 }
 
 const STREAM_CLEAR_ROLES = new Set([Roles.PLAYER, Roles.VISUALIZER]);
@@ -116,6 +144,11 @@ export class SendspinClient {
   private connected = false;
   private serverInfo?: ServerInfo;
   private serverHelloResolve?: () => void;
+  /** Noise transport once the handshake is up; null on an unencrypted connection. */
+  private transport: NoiseTransport | null = null;
+  private readonly encryption?: SendspinClientEncryption;
+  private authenticatedServerId?: string;
+  private pskCategory?: PskCategory;
   private timeFilter = new SendspinTimeFilter();
   private streamActive = false;
   private currentAudioFormat?: AudioFormat;
@@ -159,6 +192,7 @@ export class SendspinClient {
     this.sourceSupport = options.sourceSupport;
     this.initialVolume = options.initialVolume ?? 100;
     this.initialMuted = options.initialMuted ?? false;
+    this.encryption = options.encryption;
     this.setStaticDelayMs(options.staticDelayMs ?? 0);
   }
 
@@ -208,8 +242,21 @@ export class SendspinClient {
     }, timeoutMs);
     await openPromise.finally(() => clearTimeout(timer));
 
-    await this.sendClientHello();
-    await this.waitForServerHello(timeoutMs);
+    if (this.encryption) {
+      /*
+       * Encryption reverses the hello order.
+       *
+       * The server greets first, unprompted, because the identity question is
+       * already settled by the handshake — `server/init` carried the key it then
+       * proved. Sending our hello first would leave both sides waiting.
+       */
+      await this.runNoiseHandshake(timeoutMs);
+      await this.waitForServerHello(timeoutMs);
+      await this.sendClientHello();
+    } else {
+      await this.sendClientHello();
+      await this.waitForServerHello(timeoutMs);
+    }
 
     if (this.roles.includes(Roles.PLAYER)) {
       await this.sendPlayerState({
@@ -244,10 +291,20 @@ export class SendspinClient {
   async sendPlayerState(state: PlayerStatePayload): Promise<void> {
     if (!this.isConnected) throw new Error('Client is not connected');
     const { state: clientState, ...playerState } = state as PlayerStatePayload & { state?: ClientStateType };
+    /*
+     * Report availability in both spellings while the transition lasts.
+     *
+     * `available` superseded the `state` enum, which could only ever say "busy
+     * elsewhere". A server reading only the boolean would otherwise never hear a
+     * client that reports being busy, and one reading only the enum would miss it
+     * the other way round — so send both, as the reference clients do.
+     */
     const message: ClientStateMessage = {
       type: 'client/state',
       payload: {
-        ...(clientState ? { state: clientState } : {}),
+        ...(clientState
+          ? { available: clientState !== ClientStateType.EXTERNAL_SOURCE, state: clientState }
+          : {}),
         ...(Object.keys(playerState).length ? { player: playerState } : {}),
       },
     };
@@ -388,6 +445,84 @@ export class SendspinClient {
     return this.timeFilter.computeServerTime(captureTimestampUs);
   }
 
+  /**
+   * Run the cleartext init exchange and the KKpsk2 handshake, then switch to
+   * transport mode.
+   *
+   * Driven with its own frame listener rather than through the normal dispatch: the
+   * bring-up frames are cleartext and strictly ordered, and mixing them into the
+   * application router would mean teaching that router about states it never sees
+   * again once the handshake is done.
+   */
+  private async runNoiseHandshake(timeoutMs: number): Promise<void> {
+    const encryption = this.encryption;
+    if (!encryption || !this.ws) return;
+    const driver = beginClientHandshake({
+      identity: encryption.identity,
+      suite: encryption.suite ?? '25519_ChaChaPoly_SHA256',
+      pskResolver: encryption.pskResolver,
+      expectedServerId: encryption.expectedServerId,
+    });
+
+    const ws = this.ws;
+    const frames: string[] = [];
+    let notify: (() => void) | null = null;
+    const onFrame = (data: WebSocket.RawData, isBinary: boolean): void => {
+      if (isBinary) return; // Handshake frames are TEXT; transport frames come later.
+      frames.push(data.toString());
+      notify?.();
+    };
+    ws.on('message', onFrame);
+
+    const nextFrame = async (what: string): Promise<string> => {
+      const deadline = Date.now() + timeoutMs;
+      while (!frames.length) {
+        if (Date.now() > deadline) throw new Error(`Timed out waiting for ${what}`);
+        await new Promise<void>((resolve) => {
+          notify = resolve;
+          setTimeout(resolve, 50);
+        });
+        notify = null;
+      }
+      return frames.shift()!;
+    };
+
+    try {
+      ws.send(driver.clientInit);
+      driver.onServerInit(await nextFrame('server/init'));
+      const { send, result } = await driver.onMessage1(await nextFrame('Noise message 1'));
+      ws.send(send);
+      this.transport = result.transport;
+      this.authenticatedServerId = result.serverId;
+      this.pskCategory = result.psk.category;
+    } finally {
+      ws.off('message', onFrame);
+      // Anything that arrived while we were still swapping listeners is a transport
+      // frame and must not be dropped.
+      for (const frame of frames) {
+        this.handleWsMessage(Buffer.from(frame));
+      }
+    }
+  }
+
+  /** Whether this connection carries its application messages under Noise. */
+  get isEncrypted(): boolean {
+    return this.transport !== null;
+  }
+
+  /** The server's authenticated `server_id`, or undefined on an unencrypted connection. */
+  get encryptedServerId(): string | undefined {
+    return this.authenticatedServerId;
+  }
+
+  /**
+   * How this connection was admitted. `SENTINEL` means the published constant PSK
+   * did it: confidential, but authenticating nothing.
+   */
+  get admittedWith(): PskCategory | undefined {
+    return this.pskCategory;
+  }
+
   private async waitForServerHello(timeoutMs: number): Promise<void> {
     if (this.serverInfo) return;
     await new Promise<void>((resolve, reject) => {
@@ -402,19 +537,31 @@ export class SendspinClient {
   }
 
   private async sendClientHello(): Promise<void> {
+    const encrypted = this.transport !== null;
     const payload: ClientHelloPayload = {
-      client_id: this.clientId,
+      /*
+       * Under encryption the identity came from `client/init` and the handshake
+       * proved it, so repeating it here is at best redundant and at worst a
+       * contradiction the server has to refuse. Same for `version`.
+       */
+      ...(encrypted ? {} : { client_id: this.clientId, version: 1 }),
       name: this.clientName,
-      version: 1,
       supported_roles: this.roles,
       device_info: this.deviceInfo,
+      // We do not pair, so the honest answers are "no trust" and "unpaired welcome".
+      ...(encrypted ? { unpaired_access: { enabled: true } } : {}),
       ['player@v1_support']: this.roles.includes(Roles.PLAYER) ? this.playerSupport : undefined,
       ['artwork@v1_support']: this.roles.includes(Roles.ARTWORK) ? this.artworkSupport : undefined,
-      ['visualizer@_draft_r1_support']: this.roles.includes(Roles.VISUALIZER)
+      // `Roles.VISUALIZER` is `visualizer@v1`, so its support object belongs under the
+      // versioned key; the draft key would have the server parse it as the other wire.
+      ['visualizer@v1_support']: this.roles.includes(Roles.VISUALIZER)
+        ? this.visualizerSupport
+        : undefined,
+      ['visualizer@_draft_r1_support']: this.roles.includes(Roles.VISUALIZER_DRAFT_R1)
         ? this.visualizerSupport
         : undefined,
       ['source@v1_support']: this.roles.includes(Roles.SOURCE) ? this.sourceSupport : undefined,
-    };
+    } as ClientHelloPayload;
     const message: ClientHelloMessage = { type: 'client/hello', payload };
     await this.sendMessage(message);
   }
@@ -432,6 +579,12 @@ export class SendspinClient {
       throw new Error('WebSocket is not connected');
     }
     const data = JSON.stringify(message);
+    if (this.transport) {
+      for (const frame of this.transport.encodeText(data)) {
+        this.ws.send(frame);
+      }
+      return;
+    }
     this.ws.send(data);
   }
 
@@ -439,10 +592,20 @@ export class SendspinClient {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
       throw new Error('WebSocket is not connected');
     }
+    if (this.transport) {
+      for (const frame of this.transport.encodeBinary(payload)) {
+        this.ws.send(frame);
+      }
+      return;
+    }
     this.ws.send(payload);
   }
 
   private handleWsMessage(data: WebSocket.RawData): void {
+    if (this.transport) {
+      this.handleEncryptedFrame(Buffer.from(data as Buffer));
+      return;
+    }
     if (typeof data === 'string') {
       void this.handleJsonMessage(data);
       return;
@@ -451,6 +614,26 @@ export class SendspinClient {
       this.handleBinaryMessage(Buffer.from(data));
       return;
     }
+  }
+
+  /** Decrypt one transport frame and route it as if it had arrived in the clear. */
+  private handleEncryptedFrame(frame: Buffer): void {
+    if (!this.transport) return;
+    let decoded;
+    try {
+      decoded = this.transport.decode(frame);
+    } catch {
+      // A frame that fails authentication is not recoverable: drop the connection
+      // rather than carry on with a peer we can no longer verify.
+      void this.disconnect();
+      return;
+    }
+    if (!decoded) return; // A fragment; the message is still being assembled.
+    if (decoded.kind === 'text') {
+      void this.handleJsonMessage(decoded.data);
+      return;
+    }
+    this.handleBinaryMessage(decoded.data);
   }
 
   private async handleJsonMessage(raw: string): Promise<void> {
@@ -509,10 +692,15 @@ export class SendspinClient {
   }
 
   private handleServerHello(payload: ServerHelloPayload): void {
+    /*
+     * Under encryption the hello is only `{name}` — the id came from `server/init`
+     * and the handshake proved it, so take it from there rather than from a field
+     * the message no longer carries.
+     */
     this.serverInfo = {
-      serverId: payload.server_id,
+      serverId: this.authenticatedServerId ?? payload.server_id,
       name: payload.name,
-      version: payload.version,
+      version: payload.version ?? 1,
     };
     this.serverHelloResolve?.();
     this.serverHelloResolve = undefined;
