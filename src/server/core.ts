@@ -11,7 +11,17 @@ import {
   SourceStateType,
   type RoleName,
 } from '../types.js';
-import { SendspinSession, type SendspinSessionHooks, type SendspinPcmFrame, type SendspinConnectionMeta, type PlayerFormat } from './session.js';
+import {
+  SendspinSession,
+  type SendspinSessionHooks,
+  type SendspinPcmFrame,
+  type SendspinConnectionMeta,
+  type SendspinSecurity,
+  type SendspinServerInfo,
+  type PlayerFormat,
+} from './session.js';
+import { Identity, SENTINEL_PSK_ID } from '../noise/keys.js';
+import { PskCategory, SENTINEL_RESOLVED, type PskProvider, type ResolvedPsk } from '../noise/handshake.js';
 
 /**
  * Core Sendspin session manager: tracks WebSocket sessions and routes server-driven messages.
@@ -45,6 +55,46 @@ export class SendspinCore {
   // intentional leave (user_request/shutdown) from a dropped socket afterwards.
   private readonly recentGoodbyeByClientId = new Map<string, { reason: GoodbyeReason; at: number }>();
   private readonly heartbeatTimer: ReturnType<typeof setInterval>;
+  private security: SendspinSecurity | null = null;
+  private serverInfo: SendspinServerInfo = { serverId: 'server', name: 'Sendspin Server' };
+
+  /**
+   * Name this server to its clients.
+   *
+   * Call this before accepting connections. `serverId` should be something stable
+   * and unique to this machine — a MAC-derived id, not a constant — because a
+   * client with more than one server on the network tells them apart by it.
+   */
+  configureServer(info: Partial<SendspinServerInfo>): void {
+    this.serverInfo = { ...this.serverInfo, ...info };
+  }
+
+  /**
+   * Turn on the encrypted path.
+   *
+   * `identity` must be persisted and reloaded: it is this server's `server_id`
+   * under encryption, so a fresh one on every boot looks like a different server.
+   * With no `pskProvider` every client is admitted with the published Sentinel
+   * PSK — encrypted against a passive listener, authenticating nothing, which is
+   * what unpaired playback means.
+   */
+  enableEncryption(identity: Identity, pskProvider?: PskProvider): void {
+    this.security = {
+      identity,
+      pskProvider: pskProvider ?? (() => SENTINEL_RESOLVED),
+    };
+    this.serverInfo = { ...this.serverInfo, serverId: identity.peerId };
+  }
+
+  /** Whether the encrypted path is available. */
+  isEncryptionEnabled(): boolean {
+    return this.security !== null;
+  }
+
+  /** This server's `server_id`: its public key when encrypted, else the configured id. */
+  getServerId(): string {
+    return this.serverInfo.serverId;
+  }
 
   constructor() {
     this.heartbeatTimer = setInterval(() => this.sweepHeartbeats(), HEARTBEAT_INTERVAL_MS);
@@ -75,11 +125,19 @@ export class SendspinCore {
     connectionReason: ConnectionReason = ConnectionReason.DISCOVERY,
   ): void {
     const meta = this.extractConnectionMetadata(req);
-    const session = new SendspinSession(ws, req ?? null, connectionReason, {
-      zoneId: meta.zoneId,
-      playerId: meta.playerId,
-      remote: req?.socket?.remoteAddress ?? null,
-    });
+    const session = new SendspinSession(
+      ws,
+      req ?? null,
+      connectionReason,
+      {
+        zoneId: meta.zoneId,
+        playerId: meta.playerId,
+        remote: req?.socket?.remoteAddress ?? null,
+      },
+      {},
+      this.security,
+      this.serverInfo,
+    );
     this.sessionsBySocket.set(ws, session);
     this.aliveBySocket.set(ws, true);
 

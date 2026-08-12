@@ -55,6 +55,44 @@ import {
   VisualizerSpectrumConfig,
 } from '../types.js';
 import { serverNowUs } from './clock.js';
+import {
+  beginServerHandshake,
+  HandshakeAbortedError,
+  isClientInit,
+  PskCategory,
+  type HandshakeStep1,
+  type PskProvider,
+} from '../noise/handshake.js';
+import type { Identity } from '../noise/keys.js';
+import { NoiseTransport } from '../noise/wire.js';
+
+/**
+ * What a session needs to speak the encrypted path.
+ *
+ * Without it a `client/init` is refused and only transition-mode (unencrypted)
+ * clients can connect. `identity` must be stable across restarts: it *is* the
+ * server's `server_id`, and regenerating it makes us a different server to every
+ * client that remembered us.
+ */
+export interface SendspinSecurity {
+  identity: Identity;
+  pskProvider: PskProvider;
+}
+
+/**
+ * How this server names itself to clients.
+ *
+ * `serverId` must be unique on the network and stable across restarts: a client
+ * doing multi-server arbitration keys on it, so two servers sharing one id are
+ * indistinguishable and a client will treat them as the same machine. Under
+ * encryption it is the identity's public key and this value is ignored.
+ */
+export interface SendspinServerInfo {
+  serverId: string;
+  name: string;
+}
+
+const DEFAULT_SERVER_INFO: SendspinServerInfo = { serverId: 'server', name: 'Sendspin Server' };
 
 const clampU16 = (v: number): number => Math.max(0, Math.min(65535, Math.round(v)));
 const clampU8 = (v: number): number => Math.max(0, Math.min(255, Math.round(v)));
@@ -226,6 +264,20 @@ export class SendspinSession {
   private unpairedAccess = false;
   /** Deviations already reported, so a chatty client is flagged once per reason. */
   private readonly flaggedNoncompliance = new Set<string>();
+  /**
+   * Where this connection is in the Noise bring-up.
+   *
+   * `plaintext` covers both "nothing decided yet" and a transition-mode client that
+   * opened with `client/hello`; the two are distinguished by `ready`.
+   */
+  private noisePhase: 'plaintext' | 'awaiting-message2' | 'encrypted' = 'plaintext';
+  private handshake: HandshakeStep1 | null = null;
+  private transport: NoiseTransport | null = null;
+  private security: SendspinSecurity | null = null;
+  private authenticatedClientId: string | null = null;
+  private pskCategory: PskCategory | null = null;
+  private readonly serverName: string;
+  private readonly serverId: string;
 
   private hooks: SendspinSessionHooks = {};
   private hooksAttached = false;
@@ -254,8 +306,30 @@ export class SendspinSession {
     private connectionReason: ConnectionReason = ConnectionReason.DISCOVERY,
     private readonly connectionMeta: SendspinConnectionMeta = {},
     hooks: SendspinSessionHooks = {},
+    security: SendspinSecurity | null = null,
+    serverInfo: SendspinServerInfo = DEFAULT_SERVER_INFO,
   ) {
     this.hooks = hooks;
+    this.security = security;
+    this.serverName = serverInfo.name;
+    // Under encryption the identity's public key *is* the server_id, so prefer it
+    // over anything configured — the two must not be able to disagree.
+    this.serverId = security ? security.identity.peerId : serverInfo.serverId;
+  }
+
+  /** Whether this connection is carrying its application messages under Noise. */
+  isEncrypted(): boolean {
+    return this.noisePhase === 'encrypted';
+  }
+
+  /**
+   * How this connection was admitted, or null when it is unencrypted.
+   *
+   * `SENTINEL` means the published constant PSK admitted it: encrypted against a
+   * passive listener, but authenticating nothing. Do not treat it as paired.
+   */
+  getPskCategory(): PskCategory | null {
+    return this.pskCategory;
   }
 
   setHooks(
@@ -432,7 +506,32 @@ export class SendspinSession {
     }
   }
 
+  /**
+   * A cleartext frame from the socket.
+   *
+   * Only the Noise bring-up and transition-mode clients arrive here; once
+   * encryption is up every application message is a binary frame and reaches
+   * {@link dispatchText} through the transport instead.
+   */
   handleText(text: string): void {
+    if (this.noisePhase === 'awaiting-message2') {
+      this.completeHandshake(text);
+      return;
+    }
+    if (this.noisePhase === 'encrypted') {
+      // Post-handshake cleartext is not part of the protocol and must not be
+      // treated as application input — that would undo the encryption.
+      this.closeWith(1008, 'cleartext frame after the Noise handshake');
+      return;
+    }
+    if (!this.ready && isClientInit(text)) {
+      void this.startHandshake(text);
+      return;
+    }
+    this.dispatchText(text);
+  }
+
+  private dispatchText(text: string): void {
     let msg: ClientInboundMessage & { type: string };
     try {
       msg = JSON.parse(text);
@@ -480,8 +579,84 @@ export class SendspinSession {
     }
   }
 
+  /** Run the cleartext init exchange and put Noise message 1 on the wire. */
+  private async startHandshake(clientInitText: string): Promise<void> {
+    if (!this.security) {
+      // Refusing loudly beats falling back to plaintext: a client that asked for
+      // encryption should not silently get a connection without it.
+      this.closeWith(1008, 'encryption not configured on this server');
+      return;
+    }
+    try {
+      this.handshake = await beginServerHandshake({
+        clientInitText,
+        identity: this.security.identity,
+        pskProvider: this.security.pskProvider,
+      });
+    } catch (error) {
+      // The spec has the server close silently on a failed handshake, so no
+      // application-level error is sent back.
+      this.closeWith(1008, error instanceof HandshakeAbortedError ? error.message : 'handshake failed');
+      return;
+    }
+    this.noisePhase = 'awaiting-message2';
+    for (const frame of this.handshake.send) {
+      this.sendRawText(frame);
+    }
+  }
+
+  /** Consume Noise message 2 and switch the connection to transport mode. */
+  private completeHandshake(message2Text: string): void {
+    const pending = this.handshake;
+    if (!pending) {
+      this.closeWith(1008, 'no handshake in progress');
+      return;
+    }
+    let result;
+    try {
+      result = pending.finish(message2Text);
+    } catch (error) {
+      this.closeWith(1008, error instanceof HandshakeAbortedError ? error.message : 'handshake failed');
+      return;
+    }
+    this.handshake = null;
+    this.transport = result.transport;
+    this.noisePhase = 'encrypted';
+    // The client_id is now the client's authenticated static key rather than a
+    // string it asked us to believe, so the hello must not be allowed to change it.
+    this.authenticatedClientId = result.clientId;
+    this.pskCategory = result.psk.category;
+    this.clientId = result.clientId;
+  }
+
   handleBinary(data: WebSocket.RawData): void {
     const buf = Buffer.isBuffer(data) ? data : Buffer.from(data as ArrayBuffer);
+    if (this.noisePhase === 'encrypted') {
+      this.handleEncryptedFrame(buf);
+      return;
+    }
+    this.handleAppBinary(buf);
+  }
+
+  /** Decrypt one transport frame and route its contents as if it arrived in the clear. */
+  private handleEncryptedFrame(frame: Buffer): void {
+    if (!this.transport) return;
+    let decoded;
+    try {
+      decoded = this.transport.decode(frame);
+    } catch {
+      this.closeWith(1008, 'Noise transport frame failed authentication');
+      return;
+    }
+    if (!decoded) return; // A fragment; the message is still being assembled.
+    if (decoded.kind === 'text') {
+      this.dispatchText(decoded.data);
+      return;
+    }
+    this.handleAppBinary(decoded.data);
+  }
+
+  private handleAppBinary(buf: Buffer): void {
     let header: { messageType: number; timestampUs: number } | null = null;
     try {
       header = unpackBinaryHeader(buf);
@@ -501,25 +676,32 @@ export class SendspinSession {
   }
 
   private handleHello(payload: any): void {
+    const encrypted = this.noisePhase === 'encrypted';
+    /*
+     * Under encryption `client_id` and `version` belong to `client/init` and are
+     * omitted here, so only a transition-mode hello has to carry them.
+     */
     const version = typeof payload?.version === 'number' ? payload.version : null;
-    if (version !== 1) {
-      try {
-        this.ws.close(1008, 'invalid protocol version');
-      } catch {
-        /* ignore */
-      }
+    if (!encrypted && version !== 1) {
+      this.closeWith(1008, 'invalid protocol version');
       return;
     }
     const rawClientId = typeof payload?.client_id === 'string' ? payload.client_id.trim() : '';
-    if (!rawClientId) {
-      try {
-        this.ws.close(1008, 'missing client_id');
-      } catch {
-        /* ignore */
+    if (encrypted) {
+      // The authenticated static key wins. A hello that claims a different id is
+      // trying to be someone else, which is exactly what encryption should stop.
+      if (rawClientId && rawClientId !== this.authenticatedClientId) {
+        this.closeWith(1008, 'client_id does not match the authenticated identity');
+        return;
       }
-      return;
+      this.clientId = this.authenticatedClientId;
+    } else {
+      if (!rawClientId) {
+        this.closeWith(1008, 'missing client_id');
+        return;
+      }
+      this.clientId = rawClientId;
     }
-    this.clientId = rawClientId;
     this.clientName = typeof payload?.name === 'string' ? payload.name.trim() : null;
     const supportedRoles: RoleName[] = Array.isArray(payload.supported_roles) ? payload.supported_roles : [];
     if (!supportedRoles.length) {
@@ -847,17 +1029,47 @@ export class SendspinSession {
     }
   }
 
+  /**
+   * Identify the server, in whichever of the two shapes this connection uses.
+   *
+   * Under encryption `server/hello` is only `{name}` — identity came from
+   * `server/init` and the roles move to `server/activate`. The wider legacy shape
+   * (`server_id`/`version`/`active_roles`/`connection_reason`) is transition-mode
+   * only; the reference calls it `LegacyServerHelloMessage` and still accepts it.
+   */
   private sendServerHello(): void {
     if (!this.roles.length) return;
+    if (this.noisePhase === 'encrypted') {
+      this.sendJson({ type: 'server/hello', payload: { name: this.serverName } });
+      this.sendServerActivate();
+      return;
+    }
     const payload: ServerHelloPayload = {
-      server_id: 'server',
-      name: 'Sendspin Server',
+      server_id: this.serverId,
+      name: this.serverName,
       version: 1,
       active_roles: this.roles.map((r) => r as any),
       connection_reason: this.connectionReason,
     };
     const message: ServerHelloMessage = { type: 'server/hello', payload };
     this.sendJson(message);
+  }
+
+  /**
+   * Declare what this connection is currently for.
+   *
+   * Encrypted connections learn their roles here rather than from the hello.
+   * `playback` is the only activity we ever claim: pairing and management are not
+   * implemented, so admission rests entirely on the Sentinel PSK.
+   */
+  private sendServerActivate(): void {
+    this.sendJson({
+      type: 'server/activate',
+      payload: {
+        activities: ['playback'],
+        active_roles: this.roles.map((r) => r as any),
+      },
+    });
   }
 
   sendStreamStart(format?: Partial<PlayerFormat>): void {
@@ -1490,11 +1702,40 @@ export class SendspinSession {
       this.backpressureEvents.push(this.lastBackpressureTs);
       return;
     }
+    if (this.transport) {
+      // The role type byte is already the first byte of `buf`, which is exactly the
+      // transport's type-byte convention — no extra wrapping needed.
+      for (const frame of this.transport.encodeBinary(buf)) {
+        this.ws.send(frame);
+      }
+      return;
+    }
     this.ws.send(buf);
   }
 
   private sendJson(message: any): void {
     if (this.ws.readyState !== WebSocket.OPEN) return;
-    this.ws.send(JSON.stringify(message));
+    const text = JSON.stringify(message);
+    if (this.transport) {
+      for (const frame of this.transport.encodeText(text)) {
+        this.ws.send(frame);
+      }
+      return;
+    }
+    this.ws.send(text);
+  }
+
+  /** A cleartext TEXT frame, used only by the Noise bring-up. */
+  private sendRawText(text: string): void {
+    if (this.ws.readyState !== WebSocket.OPEN) return;
+    this.ws.send(text);
+  }
+
+  private closeWith(code: number, reason: string): void {
+    try {
+      this.ws.close(code, reason);
+    } catch {
+      /* ignore */
+    }
   }
 }
